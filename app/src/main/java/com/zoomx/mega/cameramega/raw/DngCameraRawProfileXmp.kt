@@ -1,0 +1,84 @@
+package com.zoomx.mega.cameramega.raw
+
+import java.security.MessageDigest
+
+internal object DngCameraRawProfileXmp {
+    const val TAG_XMP = 700
+
+    private const val CAMERA_RAW_VERSION = "16.0"
+    private const val PROCESS_VERSION = "15.4"
+
+    fun build(
+        profileLookName: String,
+        includeProfileGainTableMap: Boolean,
+        includeProfileToneCurve: Boolean,
+    ): ByteArray {
+        require(profileLookName.isNotBlank()) { "Camera Raw Look name must not be blank" }
+        require(includeProfileGainTableMap || includeProfileToneCurve) {
+            "Camera Raw Look must enable at least one profile operation"
+        }
+        val escapedProfileLookName = escapeXmlAttribute(profileLookName)
+        val lookUuid = stableLookUuid(profileLookName)
+        val profileOperationAttributes = buildList {
+            if (includeProfileGainTableMap) add("crs:ProfileGainTableMap=\"100\"")
+            if (includeProfileToneCurve) add("crs:ProfileToneCurve=\"100\"")
+        }.joinToString(separator = "\n                  ")
+        return """
+            <x:xmpmeta xmlns:x="adobe:ns:meta/" x:xmptk="CameraMega">
+             <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+              <rdf:Description rdf:about=""
+               xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+               crs:Version="$CAMERA_RAW_VERSION"
+               crs:ProcessVersion="$PROCESS_VERSION"
+               crs:HasSettings="True"
+               crs:AlreadyApplied="False">
+               <crs:Look>
+                <rdf:Description
+                 crs:Name="$escapedProfileLookName"
+                 crs:Amount="1"
+                 crs:UUID="$lookUuid"
+                 crs:SupportsMonochrome="false"
+                 crs:SupportsOutputReferred="false">
+                 <crs:Group>
+                  <rdf:Alt>
+                   <rdf:li xml:lang="x-default">Profiles</rdf:li>
+                  </rdf:Alt>
+                 </crs:Group>
+                 <crs:Parameters
+                  crs:Version="$CAMERA_RAW_VERSION"
+                  crs:ProcessVersion="$PROCESS_VERSION"
+                  $profileOperationAttributes
+                  crs:ConvertToGrayscale="False"/>
+                </rdf:Description>
+               </crs:Look>
+              </rdf:Description>
+             </rdf:RDF>
+            </x:xmpmeta>
+        """.trimIndent().toByteArray(Charsets.UTF_8)
+    }
+
+    private fun stableLookUuid(profileLookName: String): String {
+        
+        
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest("CameraMega Camera Raw Look:$profileLookName".toByteArray(Charsets.UTF_8))
+        return digest.take(16).joinToString(separator = "") { byte ->
+            "%02X".format(byte.toInt() and 0xFF)
+        }
+    }
+
+    private fun escapeXmlAttribute(value: String): String = buildString(value.length) {
+        value.forEach { character ->
+            append(
+                when (character) {
+                    '&' -> "&amp;"
+                    '<' -> "&lt;"
+                    '>' -> "&gt;"
+                    '"' -> "&quot;"
+                    '\'' -> "&apos;"
+                    else -> character
+                }
+            )
+        }
+    }
+}
