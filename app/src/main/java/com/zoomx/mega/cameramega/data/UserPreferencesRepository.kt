@@ -273,7 +273,9 @@ data class UserPreferences(
     val activeEffectParamsJson: String = "",
     val customPresetsJson: String = "",
     val activePresetId: String? = null,
-    val deletedBuiltInIds: String = ""
+    val deletedBuiltInIds: String = "",
+    val isFirstLaunch: Boolean = true,
+    val languagePromptComplete: Boolean = false,
 ) {
     val activeEffectParams: EffectParams
         get() = EffectParams.fromJson(activeEffectParamsJson)
@@ -538,6 +540,8 @@ class UserPreferencesRepository(private val context: Context) {
         private val DELETED_BUILT_IN_IDS = stringPreferencesKey("deleted_built_in_ids")
         private val CAMERA_STARTUP_DEFAULTS_RESTORED_V1 =
             booleanPreferencesKey("camera_startup_defaults_restored_v1")
+        private val IS_FIRST_LAUNCH = booleanPreferencesKey("is_first_launch")
+        private val LANGUAGE_PROMPT_COMPLETE = booleanPreferencesKey("language_prompt_complete")
     }
 
     
@@ -851,7 +855,11 @@ class UserPreferencesRepository(private val context: Context) {
                 activeEffectParamsJson = preferences[ACTIVE_EFFECT_PARAMS_JSON] ?: "",
                 customPresetsJson = preferences[CUSTOM_PRESETS_JSON] ?: "",
                 activePresetId = preferences[ACTIVE_PRESET_ID],
-                deletedBuiltInIds = preferences[DELETED_BUILT_IN_IDS] ?: ""
+                deletedBuiltInIds = preferences[DELETED_BUILT_IN_IDS] ?: "",
+                isFirstLaunch = preferences[IS_FIRST_LAUNCH]
+                    ?: !preferences.contains(CAPTURE_MODE),
+                languagePromptComplete = preferences[LANGUAGE_PROMPT_COMPLETE]
+                    ?: preferences.contains(CAPTURE_MODE),
             )
         }
 
@@ -2499,6 +2507,18 @@ class UserPreferencesRepository(private val context: Context) {
     suspend fun saveDeletedBuiltInIds(ids: String) {
         context.dataStore.edit { preferences ->
             preferences[DELETED_BUILT_IN_IDS] = ids
+        }
+    }
+
+    suspend fun setFirstLaunchComplete() {
+        context.dataStore.edit { preferences ->
+            preferences[IS_FIRST_LAUNCH] = false
+        }
+    }
+
+    suspend fun setLanguagePromptComplete() {
+        context.dataStore.edit { preferences ->
+            preferences[LANGUAGE_PROMPT_COMPLETE] = true
         }
     }
 }

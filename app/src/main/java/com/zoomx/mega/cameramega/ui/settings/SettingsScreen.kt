@@ -100,7 +100,6 @@ import androidx.lifecycle.compose.LifecycleEventEffect
 import coil.compose.AsyncImage
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.KeyboardType
-import com.zoomx.mega.cameramega.BuildConfig
 import com.zoomx.mega.cameramega.R
 import com.zoomx.mega.cameramega.camera.AspectRatio
 import com.zoomx.mega.cameramega.camera.CameraInfo
@@ -127,7 +126,6 @@ import com.zoomx.mega.cameramega.gallery.HeicExportEncoder
 import com.zoomx.mega.cameramega.gallery.Jpeg444ExportEncoder
 import com.zoomx.mega.cameramega.lut.BaselineColorCorrectionTarget
 import com.zoomx.mega.cameramega.lut.LutInfo
-import com.zoomx.mega.cameramega.lut.creator.OpenAIApiClient
 import com.zoomx.mega.cameramega.ml.DepthModelDownloadState
 import com.zoomx.mega.cameramega.ml.DepthModelManager
 import com.zoomx.mega.cameramega.raw.RawCfaCorrection
@@ -139,7 +137,6 @@ import com.zoomx.mega.cameramega.raw.SpectralFilmSelection
 import com.zoomx.mega.cameramega.ui.camera.LutEditBottomSheet
 import com.zoomx.mega.cameramega.ui.camera.LutEditorTarget
 import com.zoomx.mega.cameramega.ui.camera.autoRotate
-import com.zoomx.mega.cameramega.ui.components.LogViewerDialog
 import com.zoomx.mega.cameramega.ui.components.DepthModelDownloadDialog
 import com.zoomx.mega.cameramega.ui.components.SliderSettingItem
 import com.zoomx.mega.cameramega.ui.components.LutSelector
@@ -148,7 +145,6 @@ import com.zoomx.mega.cameramega.ui.components.RawEditPanelContentMode
 import com.zoomx.mega.cameramega.ui.components.RawDngMetadataCorrectionSettings
 import com.zoomx.mega.cameramega.ui.components.rawDcpLensOptions
 import com.zoomx.mega.cameramega.ui.components.rememberBackgroundPainter
-import com.zoomx.mega.cameramega.update.AppUpdateManager
 import com.zoomx.mega.cameramega.utils.DeviceUtil
 import com.zoomx.mega.cameramega.viewmodel.CameraViewModel
 import com.zoomx.mega.cameramega.video.VideoRecordingPath
@@ -168,10 +164,8 @@ private enum class SettingsPage {
     PHANTOM,
     INTERFACE,
     CONTENT_MANAGEMENT,
-    AI_SERVICE,
     SYSTEM_CONTROL,
     DATA_MAINTENANCE,
-    HELP_ABOUT
 }
 
 private enum class BackupOperation {
@@ -186,9 +180,6 @@ private val SettingsRippleAlpha = RippleAlpha(
     draggedAlpha = 0.08f,
     hoveredAlpha = 0.03f
 )
-
-private const val TELEGRAM_GROUP_URL = "https://t.me/photoncameraapp"
-private const val QQ_GROUP_URL = "https://qun.qq.com/universal-share/share?ac=1&authKey=SFezWP1Ub5Egb5yMc7dbc1W4BVKGzzs1Ld9RD%2BKYn%2FlXiuqD4XZCGse48v%2FNcvrq&busi_data=eyJncm91cENvZGUiOiI1Njk2MDU0NTIiLCJ0b2tlbiI6IjNTM0Z4MkN1NUpDQVU1OXJDZ0xFVlJOb0xHZHFCQ0xWc1pKQWpSVzNVT0FwaHFRcEFYR0lFTU9mNUxuNFl5TDEiLCJ1aW4iOiI0MTk3NzQ2OTYifQ%3D%3D&data=WwMa6V5hKvkhzfvOaOKz8MKqNOvSSjTxTRj6Dn-1bHP68fZuRJ66cyD5xOhydrUkF8yIA70R_yXqlFRwJGoaCQ&svctype=4&tempid=h5_group_info"
 
 private val RAW_MIN_SHUTTER_SPEED_OPTIONS = listOf(
     0L,
@@ -209,13 +200,6 @@ private fun sanitizeSettingsTonemapMode(mode: String): String {
         "SYSTEM_DEFAULT", "SRGB" -> mode
         else -> "SYSTEM_DEFAULT"
     }
-}
-
-private fun openExternalUrl(context: Context, url: String) {
-    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url)).apply {
-        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-    }
-    runCatching { context.startActivity(intent) }
 }
 
 private fun formatPersistedTreeLabel(uriString: String?): String {
@@ -337,11 +321,6 @@ fun SettingsScreen(
     val videoLutId by viewModel.videoLutId.collectAsState()
     val videoLensLockEnabled by viewModel.videoLensLockEnabled.collectAsState()
     val videoWhiteBalanceLockEnabled by viewModel.videoWhiteBalanceLockEnabled.collectAsState()
-    val openAIApiKey by viewModel.openAIApiKey.collectAsState()
-    val openAIUrl by viewModel.openAIUrl.collectAsState()
-    val openAIModel by viewModel.openAIModel.collectAsState()
-    val availableOpenAIModels by viewModel.availableOpenAIModels.collectAsState()
-    val isFetchingAIModels by viewModel.isFetchingAIModels.collectAsState()
     val phantomSaveAsNew by viewModel.phantomSaveAsNew.collectAsState()
     val phantomFrameId by viewModel.phantomFrameId.collectAsState()
     val defaultVirtualAperture by viewModel.defaultVirtualAperture.collectAsState(initial = 0f)
@@ -715,14 +694,8 @@ fun SettingsScreen(
     }
 
     
-    var showLogViewerDialog by remember { mutableStateOf(false) }
-    var showCustomAIModelDialog by remember { mutableStateOf(false) }
-    var customAIModelValue by remember { mutableStateOf("") }
     var showGhostPermissionDialog by remember { mutableStateOf(false) }
     var isGhostPermissionFlowActive by remember { mutableStateOf(false) }
-    var isCheckingUpdate by remember { mutableStateOf(false) }
-    var downloadedUpdateApk by remember { mutableStateOf<File?>(null) }
-    var showInstallUpdateDialog by remember { mutableStateOf(false) }
     var baselinePickerTarget by remember { mutableStateOf<BaselineColorCorrectionTarget?>(null) }
     var baselineRecipeEditorTarget by remember { mutableStateOf<BaselineColorCorrectionTarget?>(null) }
     var multiFrameCountSliderValue by remember(multiFrameCount) {
@@ -853,50 +826,6 @@ fun SettingsScreen(
         )
     }
 
-    if (showInstallUpdateDialog) {
-        val apkFile = downloadedUpdateApk
-        if (apkFile != null) {
-            AlertDialog(
-                onDismissRequest = { showInstallUpdateDialog = false },
-                title = {
-                    Text(
-                        text = stringResource(R.string.update_ready_title),
-                        style = MaterialTheme.typography.titleLarge
-                    )
-                },
-                text = {
-                    Text(
-                        text = stringResource(R.string.update_ready_message),
-                        style = MaterialTheme.typography.bodyMedium
-                    )
-                },
-                confirmButton = {
-                    TextButton(
-                        onClick = {
-                            val installStarted = AppUpdateManager.startInstall(context, apkFile)
-                            if (installStarted) {
-                                showInstallUpdateDialog = false
-                            } else {
-                                android.widget.Toast.makeText(
-                                    context,
-                                    R.string.update_install_permission_hint,
-                                    android.widget.Toast.LENGTH_LONG
-                                ).show()
-                            }
-                        }
-                    ) {
-                        Text(stringResource(R.string.update_install_now))
-                    }
-                },
-                dismissButton = {
-                    TextButton(onClick = { showInstallUpdateDialog = false }) {
-                        Text(stringResource(R.string.cancel))
-                    }
-                }
-            )
-        }
-    }
-
     val backgroundPainter = rememberBackgroundPainter(viewModel)
     val settingsRippleConfiguration = remember {
         RippleConfiguration(
@@ -916,10 +845,8 @@ fun SettingsScreen(
         SettingsPage.PHANTOM -> stringResource(R.string.phantom)
         SettingsPage.INTERFACE -> stringResource(R.string.settings_section_interface)
         SettingsPage.CONTENT_MANAGEMENT -> stringResource(R.string.settings_section_management)
-        SettingsPage.AI_SERVICE -> stringResource(R.string.ai_service)
         SettingsPage.SYSTEM_CONTROL -> stringResource(R.string.settings_section_system_control)
         SettingsPage.DATA_MAINTENANCE -> stringResource(R.string.settings_section_data_maintenance)
-        SettingsPage.HELP_ABOUT -> stringResource(R.string.settings_section_help_about)
     }
 
     BackHandler(enabled = selectedPage != null) {
@@ -2285,57 +2212,6 @@ fun SettingsScreen(
                     }
                 }
 
-                SettingsPage.AI_SERVICE -> {
-                    
-                    SettingsSection(
-                        title = stringResource(R.string.ai_service),
-                        showTitle = false
-                    ) {
-                        TextInputSettingItem(
-                            title = stringResource(R.string.settings_openai_api_key),
-                            description = stringResource(R.string.settings_openai_api_key_desc),
-                            value = openAIApiKey ?: "",
-                            onValueChange = { viewModel.setOpenAIApiKey(it) }
-                        )
-
-                        HorizontalDivider(
-                            color = Color.White.copy(alpha = 0.1f),
-                            modifier = Modifier.padding(vertical = 8.dp)
-                        )
-
-                        TextInputSettingItem(
-                            title = stringResource(R.string.settings_openai_base_url),
-                            description = stringResource(R.string.settings_openai_base_url_desc),
-                            value = openAIUrl ?: OpenAIApiClient.DEFAULT_API_URL,
-                            onValueChange = { viewModel.setOpenAIUrl(it) }
-                        )
-
-                        HorizontalDivider(
-                            color = Color.White.copy(alpha = 0.1f),
-                            modifier = Modifier.padding(vertical = 8.dp)
-                        )
-
-                        val customModelLabel = stringResource(R.string.settings_ai_model_custom)
-                        DropdownSettingItem(
-                            title = stringResource(R.string.settings_ai_model),
-                            description = stringResource(R.string.settings_ai_model_desc),
-                            value = openAIModel ?: OpenAIApiClient.DEFAULT_MODEL,
-                            options = availableOpenAIModels + customModelLabel,
-                            isLoading = isFetchingAIModels,
-                            enabled = !openAIApiKey.isNullOrBlank(),
-                            onExpanded = { viewModel.fetchAvailableAIModels() },
-                            onOptionSelected = {
-                                if (it == customModelLabel) {
-                                    customAIModelValue = openAIModel ?: ""
-                                    showCustomAIModelDialog = true
-                                } else {
-                                    viewModel.setOpenAIModel(it)
-                                }
-                            }
-                        )
-                    }
-                }
-
                 SettingsPage.SYSTEM_CONTROL -> {
                     
                     SettingsSection(
@@ -2465,190 +2341,11 @@ fun SettingsScreen(
                     }
                 }
 
-                SettingsPage.HELP_ABOUT -> {
-                    
-                    val isGoogleFlavor = BuildConfig.FLAVOR == "google"
-
-                    SettingsSection(
-                        title = stringResource(R.string.settings_section_help_about),
-                        showTitle = false
-                    ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { showLogViewerDialog = true }
-                                .padding(vertical = 8.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = stringResource(R.string.settings_log_viewer),
-                                    color = Color.White,
-                                    fontSize = 16.sp,
-                                    fontWeight = FontWeight.Normal
-                                )
-                                Spacer(modifier = Modifier.height(2.dp))
-                                Text(
-                                    text = stringResource(R.string.settings_log_viewer_description),
-                                    color = Color.White.copy(alpha = 0.6f),
-                                    fontSize = 13.sp,
-                                    lineHeight = 18.sp
-                                )
-                            }
-
-                            Spacer(modifier = Modifier.width(16.dp))
-
-                            Icon(
-                                imageVector = AppIcons.Article,
-                                contentDescription = stringResource(R.string.logs),
-                                tint = Color.White.copy(alpha = 0.6f)
-                            )
-                        }
-
-                        if (!isGoogleFlavor) {
-                            HorizontalDivider(
-                                color = Color.White.copy(alpha = 0.1f),
-                                modifier = Modifier.padding(vertical = 8.dp)
-                            )
-
-                            NavigationSettingItem(
-                                title = stringResource(R.string.settings_check_update),
-                                description = if (isCheckingUpdate) {
-                                    stringResource(R.string.settings_check_update_running)
-                                } else {
-                                    stringResource(
-                                        R.string.settings_check_update_description,
-                                        BuildConfig.VERSION_NAME
-                                    )
-                                },
-                                onClick = {
-                                    if (!isCheckingUpdate) {
-                                        coroutineScope.launch {
-                                            isCheckingUpdate = true
-                                            try {
-                                                android.widget.Toast.makeText(
-                                                    context,
-                                                    R.string.update_checking,
-                                                    android.widget.Toast.LENGTH_SHORT
-                                                ).show()
-                                                val release = AppUpdateManager.checkForUpdate()
-                                                if (release == null) {
-                                                    android.widget.Toast.makeText(
-                                                        context,
-                                                        R.string.update_no_update,
-                                                        android.widget.Toast.LENGTH_SHORT
-                                                    ).show()
-                                                    return@launch
-                                                }
-
-                                                android.widget.Toast.makeText(
-                                                    context,
-                                                    R.string.update_downloading,
-                                                    android.widget.Toast.LENGTH_SHORT
-                                                ).show()
-                                                downloadedUpdateApk = AppUpdateManager.downloadApk(context, release)
-                                                showInstallUpdateDialog = true
-                                            } catch (error: Exception) {
-                                                android.widget.Toast.makeText(
-                                                    context,
-                                                    R.string.update_failed,
-                                                    android.widget.Toast.LENGTH_LONG
-                                                ).show()
-                                            } finally {
-                                                isCheckingUpdate = false
-                                            }
-                                        }
-                                    }
-                                }
-                            )
-                        }
-
-                        HorizontalDivider(
-                            color = Color.White.copy(alpha = 0.1f),
-                            modifier = Modifier.padding(vertical = 8.dp)
-                        )
-
-                        NavigationSettingItem(
-                            title = stringResource(R.string.settings_community_group),
-                            description = stringResource(
-                                R.string.settings_community_group_telegram_description
-                            ),
-                            onClick = { openExternalUrl(context, TELEGRAM_GROUP_URL) }
-                        )
-
-                        HorizontalDivider(
-                            color = Color.White.copy(alpha = 0.1f),
-                            modifier = Modifier.padding(vertical = 8.dp)
-                        )
-
-                        NavigationSettingItem(
-                            title = stringResource(R.string.settings_community_group),
-                            description = stringResource(
-                                R.string.settings_community_group_qq_description
-                            ),
-                            onClick = { openExternalUrl(context, QQ_GROUP_URL) }
-                        )
-                    }
-                }
             }
 
                 Spacer(modifier = Modifier.height(32.dp))
             }
         }
-    }
-
-    
-    if (showLogViewerDialog) {
-        LogViewerDialog(
-            onDismiss = { showLogViewerDialog = false }
-        )
-    }
-
-    if (showCustomAIModelDialog) {
-        AlertDialog(
-            onDismissRequest = { showCustomAIModelDialog = false },
-            title = { Text(text = stringResource(R.string.settings_ai_model_custom_dialog_title)) },
-            text = {
-                Column {
-                    Text(
-                        text = stringResource(R.string.settings_ai_model_custom_dialog_desc),
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = Color.White.copy(alpha = 0.7f)
-                    )
-                    Spacer(modifier = Modifier.height(16.dp))
-                    androidx.compose.material3.OutlinedTextField(
-                        value = customAIModelValue,
-                        onValueChange = { customAIModelValue = it },
-                        modifier = Modifier.fillMaxWidth(),
-                        singleLine = true,
-                        colors = androidx.compose.material3.OutlinedTextFieldDefaults.colors(
-                            focusedTextColor = Color.White,
-                            unfocusedTextColor = Color.White,
-                            focusedBorderColor = Color(0xFFE5A324),
-                            unfocusedBorderColor = Color.White.copy(alpha = 0.2f)
-                        )
-                    )
-                }
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        if (customAIModelValue.isNotBlank()) {
-                            viewModel.setOpenAIModel(customAIModelValue.trim())
-                        }
-                        showCustomAIModelDialog = false
-                    }
-                ) {
-                    Text(stringResource(R.string.confirm))
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showCustomAIModelDialog = false }) {
-                    Text(stringResource(R.string.cancel))
-                }
-            }
-        )
     }
 
     if (showAddIszLensDialog) {
@@ -2920,18 +2617,6 @@ private fun SettingsCategoryOverview(
         SettingsCategoryDivider()
 
         NavigationSettingItem(
-            title = stringResource(R.string.ai_service),
-            description = listOf(
-                stringResource(R.string.settings_openai_api_key),
-                stringResource(R.string.settings_openai_base_url),
-                stringResource(R.string.settings_ai_model)
-            ).joinToString(" · "),
-            onClick = { onPageSelected(SettingsPage.AI_SERVICE) }
-        )
-
-        SettingsCategoryDivider()
-
-        NavigationSettingItem(
             title = stringResource(R.string.settings_section_system_control),
             description = listOf(
                 stringResource(R.string.settings_shutter_sound),
@@ -2951,17 +2636,6 @@ private fun SettingsCategoryOverview(
                 stringResource(R.string.settings_restore_settings)
             ).joinToString(" · "),
             onClick = { onPageSelected(SettingsPage.DATA_MAINTENANCE) }
-        )
-
-        SettingsCategoryDivider()
-
-        NavigationSettingItem(
-            title = stringResource(R.string.settings_section_help_about),
-            description = listOf(
-                stringResource(R.string.settings_log_viewer),
-                stringResource(R.string.settings_community_group)
-            ).joinToString(" · "),
-            onClick = { onPageSelected(SettingsPage.HELP_ABOUT) }
         )
     }
 }

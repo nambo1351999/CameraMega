@@ -40,7 +40,9 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -91,7 +93,18 @@ import com.zoomx.mega.cameramega.ui.settings.PhantomPipCropScreen
 import com.zoomx.mega.cameramega.ui.settings.SettingsScreen
 import com.zoomx.mega.cameramega.ui.settings.PresetEditorScreen
 import com.zoomx.mega.cameramega.ui.settings.PresetManagementScreen
+import com.zoomx.mega.cameramega.data.UserPreferencesRepository
+import com.zoomx.mega.cameramega.ui.flow.HomeMode
+import com.zoomx.mega.cameramega.ui.flow.HomeScreen
+import com.zoomx.mega.cameramega.ui.flow.LanguageOnboardingScreen
+import com.zoomx.mega.cameramega.ui.flow.OnboardingScreen
+import com.zoomx.mega.cameramega.ui.flow.SplashScreen
 import com.zoomx.mega.cameramega.ui.theme.CameraMegaTheme
+import androidx.compose.runtime.CompositionLocalProvider
+import com.zoomx.mega.cameramega.ui.flow.CmFlowColors
+import com.zoomx.mega.cameramega.ui.flow.CmFlowTypography
+import com.zoomx.mega.cameramega.ui.flow.LocalCmFlowColors
+import com.zoomx.mega.cameramega.ui.flow.LocalCmFlowTypography
 import com.zoomx.mega.cameramega.update.AppUpdateManager
 import com.zoomx.mega.cameramega.utils.BuglyHelper
 import com.zoomx.mega.cameramega.utils.DeviceUtil
@@ -105,6 +118,10 @@ import com.zoomx.mega.cameramega.viewmodel.GalleryViewModel
 import java.util.Locale
 
 object Routes {
+    const val SPLASH = "splash"
+    const val LANGUAGE = "language"
+    const val ONBOARDING = "onboarding"
+    const val HOME = "home"
     const val CAMERA = "camera"
     const val GALLERY = "gallery"
     const val PHOTO_DETAIL = "photo_detail/{tab}/{index}?photoId={photoId}"
@@ -611,6 +628,15 @@ private fun AppUpdateInstallPrompt() {
 }
 
 @Composable
+private fun FlowTheme(content: @Composable () -> Unit) {
+    CompositionLocalProvider(
+        LocalCmFlowColors provides CmFlowColors(),
+        LocalCmFlowTypography provides CmFlowTypography(),
+        content = content,
+    )
+}
+
+@Composable
 fun NavigationHost(
     cameraViewModel: CameraViewModel,
     galleryViewModel: GalleryViewModel,
@@ -625,6 +651,62 @@ fun NavigationHost(
     val navController = rememberNavController()
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = navBackStackEntry?.destination?.route
+    val userPreferences by cameraViewModel.userPreferences.collectAsState()
+    val cameraInitialized by cameraViewModel.isInitialized.collectAsState()
+    val galleryInitialized by galleryViewModel.isInitialized.collectAsState()
+    val isAppReady = cameraInitialized && galleryInitialized
+    val userPreferencesRepository = remember { UserPreferencesRepository(context) }
+    val scope = rememberCoroutineScope()
+    var isFirstLaunch by remember { mutableStateOf(userPreferences.isFirstLaunch) }
+    var languagePromptComplete by remember { mutableStateOf(userPreferences.languagePromptComplete) }
+
+    LaunchedEffect(userPreferences.isFirstLaunch, userPreferences.languagePromptComplete) {
+        isFirstLaunch = userPreferences.isFirstLaunch
+        languagePromptComplete = userPreferences.languagePromptComplete
+    }
+
+    fun navigateFromSplash() {
+        val destination = when {
+            !languagePromptComplete -> Routes.LANGUAGE
+            isFirstLaunch -> Routes.ONBOARDING
+            else -> Routes.HOME
+        }
+        navController.navigate(destination) {
+            popUpTo(Routes.SPLASH) { inclusive = true }
+        }
+    }
+
+    fun handleHomeMode(mode: HomeMode) {
+        when (mode) {
+            HomeMode.PRO_PHOTO -> {
+                cameraViewModel.setUseRawMax(false)
+                cameraViewModel.setUseJpgMax(false)
+                cameraViewModel.setCaptureMode(CaptureMode.PHOTO)
+            }
+            HomeMode.RAW_MAX -> {
+                cameraViewModel.setUseJpgMax(false)
+                cameraViewModel.setUseRawMax(true)
+                cameraViewModel.setCaptureMode(CaptureMode.PHOTO)
+            }
+            HomeMode.JPG_MAX -> {
+                cameraViewModel.setUseRawMax(false)
+                cameraViewModel.setUseJpgMax(true)
+                cameraViewModel.setCaptureMode(CaptureMode.PHOTO)
+            }
+            HomeMode.VIDEO_PRO -> cameraViewModel.setCaptureMode(CaptureMode.VIDEO)
+            HomeMode.PHANTOM -> {
+                if (!cameraViewModel.phantomMode.value) {
+                    cameraViewModel.togglePhantomMode()
+                }
+                cameraViewModel.setCaptureMode(CaptureMode.PHOTO)
+            }
+            HomeMode.FILM_LUT -> {
+                navController.navigate(Routes.FILM_LIBRARY)
+                return
+            }
+        }
+        navController.navigate(Routes.CAMERA)
+    }
     val handleGalleryBack: () -> Unit = {
         if (externalGalleryReviewReturnToCaller) {
             onExternalGalleryReviewBack()
@@ -655,7 +737,7 @@ fun NavigationHost(
     Box(modifier = Modifier.fillMaxSize()) {
         NavHost(
             navController = navController,
-            startDestination = Routes.CAMERA,
+            startDestination = Routes.SPLASH,
             enterTransition = {
                 slideInHorizontally(initialOffsetX = { it }) + fadeIn()
             },
@@ -669,6 +751,70 @@ fun NavigationHost(
                 slideOutHorizontally(targetOffsetX = { it }) + fadeOut()
             }
         ) {
+            composable(Routes.SPLASH) {
+                FlowTheme {
+                    SplashScreen(
+                        isAppReady = isAppReady,
+                        isFirstLaunch = isFirstLaunch,
+                        languagePromptComplete = languagePromptComplete,
+                        onNavigate = { firstLaunch, languageComplete ->
+                            isFirstLaunch = firstLaunch
+                            languagePromptComplete = languageComplete
+                            navigateFromSplash()
+                        },
+                    )
+                }
+            }
+
+            composable(Routes.LANGUAGE) {
+                FlowTheme {
+                    LanguageOnboardingScreen(
+                        onComplete = {
+                            val destination = if (isFirstLaunch) Routes.ONBOARDING else Routes.HOME
+                            navController.navigate(destination) {
+                                popUpTo(Routes.LANGUAGE) { inclusive = true }
+                            }
+                        },
+                        onLanguageApplied = {
+                            userPreferencesRepository.setLanguagePromptComplete()
+                            languagePromptComplete = true
+                        },
+                    )
+                }
+            }
+
+            composable(Routes.ONBOARDING) {
+                FlowTheme {
+                    OnboardingScreen(
+                        onComplete = { _ ->
+                            scope.launch {
+                                userPreferencesRepository.setFirstLaunchComplete()
+                                isFirstLaunch = false
+                            }
+                            navController.navigate(Routes.HOME) {
+                                popUpTo(Routes.ONBOARDING) { inclusive = true }
+                            }
+                        },
+                    )
+                }
+            }
+
+            composable(Routes.HOME) {
+                FlowTheme {
+                    HomeScreen(
+                        isLoading = !isAppReady,
+                        onModeSelected = ::handleHomeMode,
+                        onQuickCapture = {
+                            cameraViewModel.setCaptureMode(CaptureMode.PHOTO)
+                            navController.navigate(Routes.CAMERA)
+                        },
+                        onOpenGallery = { navController.navigate(Routes.GALLERY) },
+                        onOpenFilmLibrary = { navController.navigate(Routes.FILM_LIBRARY) },
+                        onSettingsClick = { navController.navigate(Routes.SETTINGS) },
+                    )
+                }
+            }
+
             composable(Routes.CAMERA) {
                 if (cameraViewModel.isExpanded) {
                     Row {

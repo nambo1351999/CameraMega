@@ -20,3 +20,9 @@ __pycache__
 !/scripts/research/generate_mgc_spatial_rgb_merge_static_asm.py
 .codex-tmp
 .tmp
+tools/image-gen/.env
+tools/image-gen/.venv/
+tools/image-gen/out/
+tools/image-gen/*.egg-info/
+tools/image-gen/build/
+tools/image-gen/dist/

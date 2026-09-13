@@ -1,0 +1,21 @@
+[project]
+name = "cameramega-image-gen"
+version = "1.0.0"
+description = "Generate CameraMega app assets via OpenAI GPT Image 2/2.5"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "openai>=2.32.0",
+  "pillow>=10.0.0",
+]
+
+[project.scripts]
+cameramega-image-gen = "cameramega_image_gen.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["cameramega_image_gen*"]
