@@ -8,7 +8,7 @@
 
     <application>
         <service
-                android:name="com.mega.superx.filter.camera.phantom.PhantomTileService"
+                android:name="com.mega.filter.camera.phantom.PhantomTileService"
                 android:label="@string/ghost_mode"
                 android:icon="@drawable/ghost_solid"
                 android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"

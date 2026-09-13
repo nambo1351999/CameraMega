@@ -1,0 +1,261 @@
+package com.mega.filter.camera.ui.components
+
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.layout.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.input.pointer.PointerInputScope
+import androidx.compose.ui.input.pointer.positionChange
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import kotlin.math.abs
+
+@Composable
+fun CustomSlider(
+    value: Float,
+    onValueChange: (Float) -> Unit,
+    onDoubleTap: (() -> Unit)? = null,
+    onValueChangeFinished: (() -> Unit)? = null,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    valueRange: ClosedFloatingPointRange<Float> = 0f..1f,
+    thumbRadius: Dp = 8.dp,
+    trackHeight: Dp = 4.dp,
+    activeTrackColor: Color = Color.White,
+    inactiveTrackColor: Color = Color.Gray.copy(alpha = 0.5f),
+    trackGradientColors: List<Color>? = null,
+    thumbColor: Color = Color.White
+) {
+    var isDragging by remember { mutableStateOf(false) }
+    val currentOnValueChange by rememberUpdatedState(onValueChange)
+    val currentOnDoubleTap by rememberUpdatedState(onDoubleTap)
+    val currentOnValueChangeFinished by rememberUpdatedState(onValueChangeFinished)
+
+    val density = LocalDensity.current
+    val thumbRadiusPx = with(density) { thumbRadius.toPx() }
+    val trackHeightPx = with(density) { trackHeight.toPx() }
+
+    
+    val coercedValue = value.coerceIn(valueRange.start, valueRange.endInclusive)
+
+    
+    val normalizedValue = (coercedValue - valueRange.start) / (valueRange.endInclusive - valueRange.start)
+
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(thumbRadius * 2 + 8.dp), 
+        contentAlignment = Alignment.Center
+    ) {
+        Canvas(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(thumbRadius * 2)
+                .horizontalSliderDragInput(
+                    enabled = enabled,
+                    key1 = valueRange,
+                    key2 = thumbRadiusPx,
+                    onDragStart = { isDragging = true },
+                    onDragEnd = { isDragging = false; currentOnValueChangeFinished?.invoke() },
+                    onDragCancel = { isDragging = false; currentOnValueChangeFinished?.invoke() }
+                ) { positionX ->
+                    val trackWidth = size.width - thumbRadiusPx * 2
+                    val trackStart = thumbRadiusPx
+                    val x = positionX.coerceIn(trackStart, trackStart + trackWidth)
+                    val fraction = (x - trackStart) / trackWidth
+                    val newValue = valueRange.start + fraction * (valueRange.endInclusive - valueRange.start)
+                    currentOnValueChange(newValue.coerceIn(valueRange.start, valueRange.endInclusive))
+                }
+                .pointerInput(enabled, valueRange, thumbRadiusPx) {
+                    if (!enabled) return@pointerInput
+                    detectTapGestures(
+                        onDoubleTap = {
+                            currentOnDoubleTap?.invoke()
+                        },
+                        onTap = { offset ->
+                            val trackWidth = size.width - thumbRadiusPx * 2
+                            val trackStart = thumbRadiusPx
+                            val x = offset.x.coerceIn(trackStart, trackStart + trackWidth)
+                            val fraction = (x - trackStart) / trackWidth
+                            val newValue = valueRange.start + fraction * (valueRange.endInclusive - valueRange.start)
+                            currentOnValueChange(newValue.coerceIn(valueRange.start, valueRange.endInclusive))
+                            currentOnValueChangeFinished?.invoke()
+                        }
+                    )
+                }
+        ) {
+            val trackWidth = size.width - thumbRadiusPx * 2
+            val trackStart = thumbRadiusPx
+            val trackEnd = trackStart + trackWidth
+            val centerY = size.height / 2
+
+            if (trackGradientColors != null && trackGradientColors.size >= 2) {
+                val gradientColors = if (enabled) {
+                    trackGradientColors
+                } else {
+                    trackGradientColors.map { it.copy(alpha = it.alpha * 0.3f) }
+                }
+                drawGradientTrack(
+                    startX = trackStart,
+                    endX = trackEnd,
+                    centerY = centerY,
+                    colors = gradientColors,
+                    height = trackHeightPx
+                )
+            } else {
+                
+                drawTrack(
+                    start = Offset(trackStart, centerY),
+                    end = Offset(trackEnd, centerY),
+                    color = if (enabled) inactiveTrackColor else inactiveTrackColor.copy(alpha = 0.3f),
+                    strokeWidth = trackHeightPx
+                )
+
+                
+                val activeEnd = trackStart + trackWidth * normalizedValue
+                drawTrack(
+                    start = Offset(trackStart, centerY),
+                    end = Offset(activeEnd, centerY),
+                    color = if (enabled) activeTrackColor else activeTrackColor.copy(alpha = 0.5f),
+                    strokeWidth = trackHeightPx
+                )
+            }
+
+            
+            val thumbX = trackStart + trackWidth * normalizedValue
+            drawThumb(
+                center = Offset(thumbX, centerY),
+                radius = thumbRadiusPx,
+                color = if (enabled) thumbColor else thumbColor.copy(alpha = 0.5f),
+                isDragging = isDragging,
+                enabled = enabled
+            )
+        }
+    }
+}
+
+private fun DrawScope.drawTrack(
+    start: Offset,
+    end: Offset,
+    color: Color,
+    strokeWidth: Float
+) {
+    drawLine(
+        color = color,
+        start = start,
+        end = end,
+        strokeWidth = strokeWidth,
+        cap = StrokeCap.Round
+    )
+}
+
+private fun DrawScope.drawGradientTrack(
+    startX: Float,
+    endX: Float,
+    centerY: Float,
+    colors: List<Color>,
+    height: Float
+) {
+    drawRoundRect(
+        brush = Brush.horizontalGradient(
+            colors = colors,
+            startX = startX,
+            endX = endX
+        ),
+        topLeft = Offset(startX, centerY - height / 2f),
+        size = Size(endX - startX, height),
+        cornerRadius = CornerRadius(height / 2f)
+    )
+}
+
+private fun DrawScope.drawThumb(
+    center: Offset,
+    radius: Float,
+    color: Color,
+    isDragging: Boolean,
+    enabled: Boolean
+) {
+    
+    if (isDragging && enabled) {
+        drawCircle(
+            color = color.copy(alpha = 0.2f),
+            radius = radius * 1.5f,
+            center = center
+        )
+    }
+
+    
+    drawCircle(
+        color = color,
+        radius = radius,
+        center = center
+    )
+
+    
+    drawCircle(
+        color = Color.White.copy(alpha = if (enabled) 0.7f else 0.35f),
+        radius = radius * 0.35f,
+        center = center
+    )
+}
+
+private fun Modifier.horizontalSliderDragInput(
+    enabled: Boolean,
+    key1: Any?,
+    key2: Any?,
+    onDragStart: () -> Unit,
+    onDragEnd: () -> Unit,
+    onDragCancel: () -> Unit,
+    onPositionChange: PointerInputScope.(Float) -> Unit
+): Modifier = pointerInput(enabled, key1, key2) {
+    if (!enabled) return@pointerInput
+    awaitEachGesture {
+        val down = awaitFirstDown(requireUnconsumed = false)
+        var totalX = 0f
+        var totalY = 0f
+        var dragging = false
+
+        while (true) {
+            val event = awaitPointerEvent()
+            val change = event.changes.firstOrNull { it.id == down.id }
+            if (change == null) {
+                if (dragging) onDragCancel()
+                break
+            }
+            if (!change.pressed) {
+                if (dragging) onDragEnd()
+                break
+            }
+
+            val positionChange = change.positionChange()
+            if (!dragging) {
+                totalX += positionChange.x
+                totalY += positionChange.y
+                if (abs(totalY) > viewConfiguration.touchSlop && abs(totalY) > abs(totalX)) {
+                    break
+                }
+                if (abs(totalX) <= viewConfiguration.touchSlop || abs(totalX) <= abs(totalY)) {
+                    continue
+                }
+                dragging = true
+                onDragStart()
+            }
+
+            change.consume()
+            onPositionChange(change.position.x)
+        }
+    }
+}

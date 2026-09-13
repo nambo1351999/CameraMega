@@ -1,0 +1,4339 @@
+package com.mega.filter.camera.lut
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.ColorSpace
+import android.opengl.EGL14
+import android.opengl.EGLConfig
+import android.opengl.EGLContext
+import android.opengl.EGLDisplay
+import android.opengl.EGLSurface
+import android.opengl.GLES30
+import android.opengl.GLES31
+import androidx.core.graphics.createBitmap
+import com.mega.filter.camera.model.ColorPaletteMapper
+import com.mega.filter.camera.model.ColorRecipeParams
+import com.mega.filter.camera.lut.ChromaDenoiseShaders
+import com.mega.filter.camera.processor.GlesComputeWorkGroup
+import com.mega.filter.camera.processor.DenoiseStrength
+import com.mega.filter.camera.raw.DenoiseProfileNlmConfig
+import com.mega.filter.camera.raw.DenoiseProfileShaders
+import com.mega.filter.camera.raw.HncsFilmCurveMode
+import com.mega.filter.camera.raw.HncsNaturalLightGl
+import com.mega.filter.camera.raw.HncsNaturalLightOutputPassShaders
+import com.mega.filter.camera.raw.RawProfileExposureGl
+import com.mega.filter.camera.raw.RawRenderingEngine
+import com.mega.filter.camera.raw.RawEngineTonePass
+import com.mega.filter.camera.raw.RawFullscreenQuad
+import com.mega.filter.camera.raw.RawSharpenPass
+import com.mega.filter.camera.raw.RawSrgbPass
+import com.mega.filter.camera.raw.RawToneMappingGl
+import com.mega.filter.camera.raw.RawToneMappingParameters
+import com.mega.filter.camera.utils.LargeDirectBuffer
+import com.mega.filter.camera.utils.PLog
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.FloatBuffer
+import java.nio.ShortBuffer
+import java.util.concurrent.Executors
+import kotlin.math.ln
+import kotlin.math.max
+import kotlin.math.pow
+import kotlin.math.sqrt
+
+data class LutStackRenderResult(
+    val bitmap: Bitmap,
+    
+    val luminanceGainMap: Bitmap?,
+)
+
+class LutImageProcessor(context: Context? = null) {
+    private val appContext = context?.applicationContext
+
+    @Volatile
+    private var glThread: Thread? = null
+
+    @Volatile
+    private var isReleased = false
+
+    
+    private val glDispatcher = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "LutImageProcessor-GL").apply {
+            isDaemon = true
+            glThread = this
+        }
+    }.asCoroutineDispatcher()
+
+    private var eglDisplay: EGLDisplay = EGL14.EGL_NO_DISPLAY
+    private var eglContext: EGLContext = EGL14.EGL_NO_CONTEXT
+    private var eglSurface: EGLSurface = EGL14.EGL_NO_SURFACE
+
+    private var shaderProgram = 0
+    private var imageTextureId = 0
+    private var lutTextureId = 0
+    private val basicToneTextures = BasicToneGlTextures()
+    private var framebufferId = 0
+    private var outputTextureId = 0
+    private var outputFramebufferWidth = 0
+    private var outputFramebufferHeight = 0
+    private var pboId = 0
+    private var readbackBuffer: ByteBuffer? = null
+    private var readbackBufferSize = 0
+    private val naturalLightPrograms = IntArray(RawRenderingEngine.entries.size)
+    private var naturalLightTextureId = 0
+    private var naturalLightFboId = 0
+    private var naturalLightWidth = 0
+    private var naturalLightHeight = 0
+    private var naturalLightCurveTextureId = 0
+    private var naturalLightCurveSize = 0
+    private var naturalLightDummy3DTextureId = 0
+    private var naturalLightSrgbOutputProgram = 0
+    private var naturalLightHncsOutputProgram = 0
+    private var naturalLightOutputTextureId = 0
+    private var naturalLightOutputFboId = 0
+    private var naturalLightOutputWidth = 0
+    private var naturalLightOutputHeight = 0
+    private val naturalLightHncsGl = context?.let(::HncsNaturalLightGl)
+
+    private var vertexBuffer: FloatBuffer? = null
+    private var texCoordBuffer: FloatBuffer? = null
+    private var indexBuffer: ShortBuffer? = null
+
+    private var bitmapDenoisePreconditionProgram = 0
+    private var bitmapDenoiseNlmInitProgram = 0
+    private var bitmapDenoiseNlmFusedAccuProgram = 0
+    private var bitmapDenoiseNlmFinishProgram = 0
+    private var bitmapDenoisePassthroughProgram = 0
+    private var naturalLightSrgbToLinearProgram = 0
+    private var bitmapChromaDenoiseGuideProgram = 0
+    private var bitmapChromaDenoiseProgram = 0
+    private var lutSharpenProgram = 0
+    private var lutLuminanceGainProgram = 0
+
+    private val bitmapDenoiseTexId = IntArray(2)
+    private val bitmapDenoiseFboId = IntArray(2)
+    private var bitmapDenoiseNlmU2BufferId = 0
+    private var bitmapDenoiseNlmBufferPixels = 0
+    private var bitmapDenoiseWidth = 0
+    private var bitmapDenoiseHeight = 0
+    private var lutSharpenTextureId = 0
+    private var lutSharpenFboId = 0
+    private var lutSharpenWidth = 0
+    private var lutSharpenHeight = 0
+    private val filmGrainGl = FilmGrainGl(TAG)
+
+    
+    private var hdfExtractBlurHProgram = 0
+    private var hdfBlurVProgram = 0
+    private var hdfTexId = IntArray(2)      
+    private var hdfFboId = IntArray(2)      
+    private var hdfWidth = 0
+    private var hdfHeight = 0
+    private var softLightBlurHProgram = 0
+    private var softLightTexId = IntArray(2)
+    private var softLightFboId = IntArray(2)
+    private var softLightWidth = 0
+    private var softLightHeight = 0
+
+    
+    private var clarityDownsampleProgram = 0
+    private var clarityCompositeProgram = 0
+    private val clarityPyramidTexId = IntArray(CLARITY_PYRAMID_LEVELS)
+    private val clarityPyramidFboId = IntArray(CLARITY_PYRAMID_LEVELS)
+    private val clarityPyramidWidths = IntArray(CLARITY_PYRAMID_LEVELS)
+    private val clarityPyramidHeights = IntArray(CLARITY_PYRAMID_LEVELS)
+    private var clarityOutputTextureId = 0
+    private var clarityOutputFboId = 0
+    private var clarityOutputWidth = 0
+    private var clarityOutputHeight = 0
+
+    
+    private var halationExtractBlurHProgram = 0
+    private var halationBlurVProgram = 0
+    private var halationTexId = IntArray(2)
+    private var halationFboId = IntArray(2)
+    private var halationWidth = 0
+    private var halationHeight = 0
+    private var bloomDownsampleFirstProgram = 0
+    private var bloomDownsampleProgram = 0
+    private var bloomUpsampleProgram = 0
+    private var bloomCompositeProgram = 0
+    private var bloomTexId = IntArray(0)
+    private var bloomFboId = IntArray(0)
+    private var bloomMipWidths = IntArray(0)
+    private var bloomMipHeights = IntArray(0)
+    private var bloomMipCount = 0
+    private var bloomSourceWidth = 0
+    private var bloomSourceHeight = 0
+    private var bloomOutputTextureId = 0
+    private var bloomOutputFboId = 0
+    private var bloomOutputWidth = 0
+    private var bloomOutputHeight = 0
+
+    private var isInitialized = false
+
+    
+    private var uImageTextureLoc = 0
+    private var uLutTextureLoc = 0
+    private var uLutSizeLoc = 0
+    private var uLutIntensityLoc = 0
+    private var uLutEnabledLoc = 0
+    private var uLutCurveLoc = 0
+    private var uLutColorSpaceLoc = 0
+    private var uInputColorSpaceLoc = 0
+    private var uIsHlgInputLoc = 0
+    private var uMVPMatrixLoc = 0
+
+    
+    private var uColorRecipeEnabledLoc = 0
+    private var uExposureLoc = 0
+    private var uContrastLoc = 0
+    private var uSaturationLoc = 0
+    private var uTemperatureLoc = 0
+    private var uTintLoc = 0
+    private var uFadeLoc = 0
+    private var uVibranceLoc = 0
+    private var uHighlightsLoc = 0
+    private var uShadowsLoc = 0
+    private var uToneToeLoc = 0
+    private var uToneShoulderLoc = 0
+    private var uTonePivotLoc = 0
+    private var uVignetteLoc = 0
+    private var uBleachBypassLoc = 0
+    private var uNoiseLoc = 0
+    private var uNoiseSeedLoc = 0
+    private var uLowResLoc = 0
+    private var uAspectRatioLoc = 0
+    private var uLchHueAdjustmentsLoc = 0
+    private var uLchChromaAdjustmentsLoc = 0
+    private var uLchLightnessAdjustmentsLoc = 0
+    private var uPrimaryCalibrationMatrixLoc = 0
+
+    
+    private var curveTextureId = 0
+
+    
+    suspend fun prewarmCapturePipeline(): Boolean = withContext(glDispatcher) {
+        if (isReleased) return@withContext false
+        val start = System.currentTimeMillis()
+        val ready = initialize()
+        if (ready) {
+            GLES30.glFinish()
+        }
+        PLog.d(
+            TAG,
+            "LUT capture pipeline prewarmed ready=$ready, took=${System.currentTimeMillis() - start}ms",
+        )
+        ready
+    }
+
+    
+    fun initialize(): Boolean {
+        if (isInitialized) return true
+        if (isOnGlThread()) {
+            return initializeInternal()
+        }
+        return runBlocking(glDispatcher) {
+            initializeInternal()
+        }
+    }
+
+    private fun initializeInternal(): Boolean {
+        if (isInitialized) return true
+        try {
+            
+            eglDisplay = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
+            if (eglDisplay == EGL14.EGL_NO_DISPLAY) {
+                PLog.e(TAG, "Unable to get EGL display")
+                return false
+            }
+
+            
+            val version = IntArray(2)
+            if (!EGL14.eglInitialize(eglDisplay, version, 0, version, 1)) {
+                PLog.e(TAG, "Unable to initialize EGL")
+                return false
+            }
+            val eglExtensions = EGL14.eglQueryString(eglDisplay, EGL14.EGL_EXTENSIONS).orEmpty()
+            val supportsLowPriorityContext =
+                eglExtensions.split(' ').contains("EGL_IMG_context_priority")
+
+            
+            val configAttribs = intArrayOf(
+                EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+                EGL14.EGL_RED_SIZE, 8,
+                EGL14.EGL_GREEN_SIZE, 8,
+                EGL14.EGL_BLUE_SIZE, 8,
+                EGL14.EGL_ALPHA_SIZE, 8,
+                EGL14.EGL_SURFACE_TYPE, EGL14.EGL_PBUFFER_BIT,
+                EGL14.EGL_NONE
+            )
+
+            val configs = arrayOfNulls<EGLConfig>(1)
+            val numConfigs = IntArray(1)
+            if (!EGL14.eglChooseConfig(eglDisplay, configAttribs, 0, configs, 0, 1, numConfigs, 0)) {
+                PLog.e(TAG, "Unable to choose EGL config")
+                return false
+            }
+
+            val config = configs[0] ?: return false
+
+            
+            val normalContextAttribs = intArrayOf(
+                EGL14.EGL_CONTEXT_CLIENT_VERSION, 3,
+                EGL14.EGL_NONE
+            )
+            val lowPriorityContextAttribs = intArrayOf(
+                EGL14.EGL_CONTEXT_CLIENT_VERSION, 3,
+                EGL_CONTEXT_PRIORITY_LEVEL_IMG, EGL_CONTEXT_PRIORITY_LOW_IMG,
+                EGL14.EGL_NONE
+            )
+            val contextAttribs = if (supportsLowPriorityContext) {
+                lowPriorityContextAttribs
+            } else {
+                normalContextAttribs
+            }
+            eglContext = EGL14.eglCreateContext(eglDisplay, config, EGL14.EGL_NO_CONTEXT, contextAttribs, 0)
+            if (eglContext == EGL14.EGL_NO_CONTEXT && supportsLowPriorityContext) {
+                val eglError = EGL14.eglGetError()
+                PLog.w(
+                    TAG,
+                    "Low-priority EGL context unavailable, falling back to normal priority: error=$eglError"
+                )
+                eglContext = EGL14.eglCreateContext(
+                    eglDisplay,
+                    config,
+                    EGL14.EGL_NO_CONTEXT,
+                    normalContextAttribs,
+                    0
+                )
+            }
+            if (eglContext == EGL14.EGL_NO_CONTEXT) {
+                PLog.e(TAG, "Unable to create EGL context")
+                return false
+            }
+
+            
+            val surfaceAttribs = intArrayOf(
+                EGL14.EGL_WIDTH, 1,
+                EGL14.EGL_HEIGHT, 1,
+                EGL14.EGL_NONE
+            )
+            eglSurface = EGL14.eglCreatePbufferSurface(eglDisplay, config, surfaceAttribs, 0)
+            if (eglSurface == EGL14.EGL_NO_SURFACE) {
+                PLog.e(TAG, "Unable to create EGL surface")
+                return false
+            }
+
+            
+            if (!EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)) {
+                PLog.e(TAG, "Unable to make EGL current")
+                return false
+            }
+            if (!logAndValidateComputeCapabilities()) {
+                return false
+            }
+
+            
+            initShaderProgram()
+            initBitmapDenoiseProfilePrograms()
+            initHDFPrograms()
+            initClarityPrograms()
+            initBuffers()
+
+            isInitialized = true
+            PLog.d(TAG, "LutImageProcessor initialized")
+            return true
+
+        } catch (e: Exception) {
+            PLog.e(TAG, "Failed to initialize", e)
+            return false
+        }
+    }
+
+    
+    suspend fun applyLut(
+        argbData: ShortBuffer,
+        width: Int,
+        height: Int,
+        colorSpace: ColorSpace,
+        isHlgInput: Boolean = false,
+        lutConfig: LutConfig?,
+        colorRecipeParams: ColorRecipeParams?,
+        sharpeningValue: Float = 0f,
+        noiseReductionValue: Float = 0f,
+        chromaNoiseReductionValue: Float = 0f,
+        lutMaskType: Int = 0,
+        linearInputToneMap: Boolean = false,
+        linearInputExposureEv: Float = 0f,
+        naturalLightDefaultChromaDenoise: Boolean = false,
+        rawRenderingEngine: RawRenderingEngine = RawRenderingEngine.AdobeCurve,
+        rawHncsFilmCurveMode: HncsFilmCurveMode = HncsFilmCurveMode.Standard,
+        rawToneMappingParameters: RawToneMappingParameters = RawToneMappingParameters.DEFAULT,
+    ): Bitmap = withContext(glDispatcher) {
+        currentCoroutineContext().ensureActive()
+        if (!isInitialized) {
+            if (!initialize()) {
+                
+                return@withContext createBitmap(width, height)
+            }
+        }
+
+        
+        val effectiveRecipeParams = colorRecipeParams?.let(ColorPaletteMapper::mergeIntoEffectiveParams)
+        val halation = 0f
+        val softLight = effectiveRecipeParams?.softLight ?: 0f
+        val redHalation = effectiveRecipeParams?.redHalation ?: 0f
+
+        
+        val sharpening: Float = sharpeningValue
+        val noiseReduction: Float = noiseReductionValue
+        val chromaNoiseReduction: Float = chromaNoiseReductionValue
+        val applyNaturalLightToneMap = linearInputToneMap && !isHlgInput
+        val preToneMapChromaDenoise = resolvePreToneMapChromaDenoise(
+            userStrength = chromaNoiseReduction,
+            applyNaturalLightDefault = applyNaturalLightToneMap && naturalLightDefaultChromaDenoise
+        )
+
+        
+        EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
+
+        
+        setupFramebuffer(width, height)
+        currentCoroutineContext().ensureActive()
+
+        
+        uploadImageTextureFromArgb(argbData, width, height)
+        currentCoroutineContext().ensureActive()
+
+        if (preToneMapChromaDenoise > 0) {
+            renderBitmapChromaDenoise(imageTextureId, width, height, preToneMapChromaDenoise)
+            currentCoroutineContext().ensureActive()
+        }
+
+        val chromaDenoisedTexId = if (preToneMapChromaDenoise > 0) bitmapDenoiseTexId[0] else imageTextureId
+        if (noiseReduction > 0) {
+            renderBitmapDenoiseProfile(chromaDenoisedTexId, width, height, noiseReduction)
+            currentCoroutineContext().ensureActive()
+        }
+
+        
+        if (lutConfig != null) {
+            uploadLutTexture(lutConfig)
+        }
+
+        val inputTexId = if (noiseReduction > 0) {
+            bitmapDenoiseTexId[1]
+        } else {
+            chromaDenoisedTexId
+        }
+
+        val renderInputTexId = if (applyNaturalLightToneMap) {
+            renderNaturalLightToneMap(
+                inputTexId,
+                width,
+                height,
+                rawRenderingEngine,
+                rawHncsFilmCurveMode,
+                rawToneMappingParameters,
+                linearInputExposureEv
+            )
+        } else {
+            inputTexId
+        }
+        val naturalLightApplied = applyNaturalLightToneMap && renderInputTexId != inputTexId
+        val renderColorSpace = if (naturalLightApplied) {
+            ColorSpace.get(ColorSpace.Named.SRGB)
+        } else {
+            colorSpace
+        }
+
+        
+        if (halation > 0f) {
+            renderHDFBlur(renderInputTexId, width, height, halation)
+            currentCoroutineContext().ensureActive()
+        }
+        if (softLight > 0f) {
+            renderSoftLightBlur(renderInputTexId, width, height)
+            currentCoroutineContext().ensureActive()
+        }
+        if (redHalation > 0f) {
+            renderHalationBlur(renderInputTexId, width, height, redHalation)
+            currentCoroutineContext().ensureActive()
+        }
+
+        
+        val outputBitmap = performRender(
+            width, height,
+            renderInputTexId,
+            renderColorSpace,
+            isHlgInput,
+            lutConfig,
+            effectiveRecipeParams,
+            sharpening,
+            lutMaskType,
+        )
+
+        outputBitmap
+    }
+
+    suspend fun applyLutStack(
+        argbData: ShortBuffer,
+        width: Int,
+        height: Int,
+        colorSpace: ColorSpace,
+        isHlgInput: Boolean = false,
+        baselineLayer: LutRenderLayer?,
+        creativeLayer: LutRenderLayer?,
+        sharpeningValue: Float = 0f,
+        noiseReductionValue: Float = 0f,
+        chromaNoiseReductionValue: Float = 0f,
+        linearInputToneMap: Boolean = false,
+        linearInputExposureEv: Float = 0f,
+        naturalLightDefaultChromaDenoise: Boolean = false,
+        rawRenderingEngine: RawRenderingEngine = RawRenderingEngine.AdobeCurve,
+        rawHncsFilmCurveMode: HncsFilmCurveMode = HncsFilmCurveMode.Standard,
+        rawToneMappingParameters: RawToneMappingParameters = RawToneMappingParameters.DEFAULT,
+    ): Bitmap {
+        val hasBaseline = baselineLayer?.lutConfig != null || baselineLayer?.colorRecipeParams != null
+        val hasCreative = creativeLayer?.lutConfig != null || creativeLayer?.colorRecipeParams != null
+        return when {
+            hasBaseline && hasCreative -> {
+                val runDenoiseBeforeNaturalLight = linearInputToneMap && !isHlgInput
+                val baseBitmap = applyLut(
+                    argbData = argbData,
+                    width = width,
+                    height = height,
+                    colorSpace = colorSpace,
+                    isHlgInput = isHlgInput,
+                    lutConfig = baselineLayer.lutConfig,
+                    colorRecipeParams = baselineLayer.colorRecipeParams,
+                    noiseReductionValue = if (runDenoiseBeforeNaturalLight) noiseReductionValue else 0f,
+                    chromaNoiseReductionValue = if (runDenoiseBeforeNaturalLight) chromaNoiseReductionValue else 0f,
+                    linearInputToneMap = linearInputToneMap,
+                    linearInputExposureEv = linearInputExposureEv,
+                    naturalLightDefaultChromaDenoise = naturalLightDefaultChromaDenoise,
+                    rawRenderingEngine = rawRenderingEngine,
+                    rawHncsFilmCurveMode = rawHncsFilmCurveMode,
+                    rawToneMappingParameters = rawToneMappingParameters,
+                )
+                applyLut(
+                    bitmap = baseBitmap,
+                    lutConfig = creativeLayer.lutConfig,
+                    colorRecipeParams = creativeLayer.colorRecipeParams,
+                    sharpeningValue = sharpeningValue,
+                    noiseReductionValue = if (runDenoiseBeforeNaturalLight) 0f else noiseReductionValue,
+                    chromaNoiseReductionValue = if (runDenoiseBeforeNaturalLight) 0f else chromaNoiseReductionValue
+                )
+            }
+            hasBaseline -> applyLut(
+                argbData = argbData,
+                width = width,
+                height = height,
+                colorSpace = colorSpace,
+                isHlgInput = isHlgInput,
+                lutConfig = baselineLayer.lutConfig,
+                colorRecipeParams = baselineLayer.colorRecipeParams,
+                sharpeningValue = sharpeningValue,
+                noiseReductionValue = noiseReductionValue,
+                chromaNoiseReductionValue = chromaNoiseReductionValue,
+                linearInputToneMap = linearInputToneMap,
+                linearInputExposureEv = linearInputExposureEv,
+                naturalLightDefaultChromaDenoise = naturalLightDefaultChromaDenoise,
+                rawRenderingEngine = rawRenderingEngine,
+                rawHncsFilmCurveMode = rawHncsFilmCurveMode,
+                rawToneMappingParameters = rawToneMappingParameters
+            )
+            else -> applyLut(
+                argbData = argbData,
+                width = width,
+                height = height,
+                colorSpace = colorSpace,
+                isHlgInput = isHlgInput,
+                lutConfig = creativeLayer?.lutConfig,
+                colorRecipeParams = creativeLayer?.colorRecipeParams,
+                sharpeningValue = sharpeningValue,
+                noiseReductionValue = noiseReductionValue,
+                chromaNoiseReductionValue = chromaNoiseReductionValue,
+                linearInputToneMap = linearInputToneMap,
+                linearInputExposureEv = linearInputExposureEv,
+                naturalLightDefaultChromaDenoise = naturalLightDefaultChromaDenoise,
+                rawRenderingEngine = rawRenderingEngine,
+                rawHncsFilmCurveMode = rawHncsFilmCurveMode,
+                rawToneMappingParameters = rawToneMappingParameters
+            )
+        }
+    }
+
+    
+    suspend fun applyLut(
+        bitmap: Bitmap,
+        isHlgInput: Boolean = false,
+        lutConfig: LutConfig?,
+        colorRecipeParams: ColorRecipeParams?,
+        sharpeningValue: Float = 0f,
+        noiseReductionValue: Float = 0f,
+        chromaNoiseReductionValue: Float = 0f,
+        lutMaskType: Int = 0,
+        linearInputToneMap: Boolean = false,
+        naturalLightInputSrgb: Boolean = false,
+        linearInputExposureEv: Float = 0f,
+        naturalLightDefaultChromaDenoise: Boolean = false,
+        rawRenderingEngine: RawRenderingEngine = RawRenderingEngine.AdobeCurve,
+        rawHncsFilmCurveMode: HncsFilmCurveMode = HncsFilmCurveMode.Standard,
+        rawToneMappingParameters: RawToneMappingParameters = RawToneMappingParameters.DEFAULT,
+    ): Bitmap = withContext(glDispatcher) {
+        currentCoroutineContext().ensureActive()
+        if (!isInitialized) {
+            if (!initialize()) {
+                return@withContext bitmap
+            }
+        }
+
+        
+        val effectiveRecipeParams = colorRecipeParams?.let(ColorPaletteMapper::mergeIntoEffectiveParams)
+        val halation = 0f
+        val softLight = effectiveRecipeParams?.softLight ?: 0f
+        val redHalation = effectiveRecipeParams?.redHalation ?: 0f
+
+        
+        val sharpening: Float = sharpeningValue
+        val noiseReduction: Float = noiseReductionValue
+        val chromaNoiseReduction: Float = chromaNoiseReductionValue
+        val applyNaturalLightToneMap = linearInputToneMap && !isHlgInput
+        val preToneMapChromaDenoise = resolvePreToneMapChromaDenoise(
+            userStrength = chromaNoiseReduction,
+            applyNaturalLightDefault = applyNaturalLightToneMap && naturalLightDefaultChromaDenoise
+        )
+
+        
+        EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
+
+        val width = bitmap.width
+        val height = bitmap.height
+
+        
+        setupFramebuffer(width, height)
+        currentCoroutineContext().ensureActive()
+
+        
+        uploadImageTexture(bitmap)
+        currentCoroutineContext().ensureActive()
+
+        if (preToneMapChromaDenoise > 0) {
+            renderBitmapChromaDenoise(imageTextureId, width, height, preToneMapChromaDenoise)
+            currentCoroutineContext().ensureActive()
+        }
+
+        val chromaDenoisedTexId = if (preToneMapChromaDenoise > 0) bitmapDenoiseTexId[0] else imageTextureId
+        if (noiseReduction > 0) {
+            renderBitmapDenoiseProfile(chromaDenoisedTexId, width, height, noiseReduction)
+            currentCoroutineContext().ensureActive()
+        }
+
+        
+        if (lutConfig != null) {
+            uploadLutTexture(lutConfig)
+        }
+
+        val inputTexId = if (noiseReduction > 0) {
+            bitmapDenoiseTexId[1]
+        } else {
+            chromaDenoisedTexId
+        }
+        val naturalLightSourceTexId = if (applyNaturalLightToneMap && naturalLightInputSrgb) {
+            renderSrgbInputToLinear(inputTexId, width, height)
+        } else {
+            inputTexId
+        }
+        val renderInputTexId = if (applyNaturalLightToneMap) {
+            renderNaturalLightToneMap(
+                naturalLightSourceTexId,
+                width,
+                height,
+                rawRenderingEngine,
+                rawHncsFilmCurveMode,
+                rawToneMappingParameters,
+                linearInputExposureEv
+            )
+        } else {
+            inputTexId
+        }
+        val naturalLightApplied = applyNaturalLightToneMap && renderInputTexId != inputTexId
+        val renderColorSpace = if (naturalLightApplied) {
+            ColorSpace.get(ColorSpace.Named.SRGB)
+        } else {
+            bitmap.colorSpace ?: ColorSpace.get(ColorSpace.Named.SRGB)
+        }
+
+        
+        if (halation > 0f) {
+            renderHDFBlur(renderInputTexId, width, height, halation)
+            currentCoroutineContext().ensureActive()
+        }
+        if (softLight > 0f) {
+            renderSoftLightBlur(renderInputTexId, width, height)
+            currentCoroutineContext().ensureActive()
+        }
+        if (redHalation > 0f) {
+            renderHalationBlur(renderInputTexId, width, height, redHalation)
+            currentCoroutineContext().ensureActive()
+        }
+
+        
+        val outputBitmap = performRender(
+            width, height,
+            renderInputTexId,
+            renderColorSpace,
+            isHlgInput,
+            lutConfig,
+            effectiveRecipeParams,
+            sharpening,
+            lutMaskType,
+        )
+
+        outputBitmap
+    }
+
+    suspend fun applyLutStack(
+        bitmap: Bitmap,
+        isHlgInput: Boolean = false,
+        baselineLayer: LutRenderLayer?,
+        creativeLayer: LutRenderLayer?,
+        sharpeningValue: Float = 0f,
+        noiseReductionValue: Float = 0f,
+        chromaNoiseReductionValue: Float = 0f,
+        linearInputToneMap: Boolean = false,
+        linearInputExposureEv: Float = 0f,
+        naturalLightDefaultChromaDenoise: Boolean = false,
+        rawRenderingEngine: RawRenderingEngine = RawRenderingEngine.AdobeCurve,
+        rawHncsFilmCurveMode: HncsFilmCurveMode = HncsFilmCurveMode.Standard,
+        rawToneMappingParameters: RawToneMappingParameters = RawToneMappingParameters.DEFAULT,
+    ): Bitmap {
+        val hasBaseline = baselineLayer?.lutConfig != null || baselineLayer?.colorRecipeParams != null
+        val hasCreative = creativeLayer?.lutConfig != null || creativeLayer?.colorRecipeParams != null
+        return when {
+            hasBaseline && hasCreative -> {
+                val runDenoiseBeforeNaturalLight = linearInputToneMap && !isHlgInput
+                val baseBitmap = applyLut(
+                    bitmap = bitmap,
+                    isHlgInput = isHlgInput,
+                    lutConfig = baselineLayer.lutConfig,
+                    colorRecipeParams = baselineLayer.colorRecipeParams,
+                    noiseReductionValue = if (runDenoiseBeforeNaturalLight) noiseReductionValue else 0f,
+                    chromaNoiseReductionValue = if (runDenoiseBeforeNaturalLight) chromaNoiseReductionValue else 0f,
+                    linearInputToneMap = linearInputToneMap,
+                    linearInputExposureEv = linearInputExposureEv,
+                    naturalLightDefaultChromaDenoise = naturalLightDefaultChromaDenoise,
+                    rawRenderingEngine = rawRenderingEngine,
+                    rawHncsFilmCurveMode = rawHncsFilmCurveMode,
+                    rawToneMappingParameters = rawToneMappingParameters,
+                )
+                applyLut(
+                    bitmap = baseBitmap,
+                    lutConfig = creativeLayer.lutConfig,
+                    colorRecipeParams = creativeLayer.colorRecipeParams,
+                    sharpeningValue = sharpeningValue,
+                    noiseReductionValue = if (runDenoiseBeforeNaturalLight) 0f else noiseReductionValue,
+                    chromaNoiseReductionValue = if (runDenoiseBeforeNaturalLight) 0f else chromaNoiseReductionValue
+                )
+            }
+            hasBaseline -> applyLut(
+                bitmap = bitmap,
+                isHlgInput = isHlgInput,
+                lutConfig = baselineLayer.lutConfig,
+                colorRecipeParams = baselineLayer.colorRecipeParams,
+                sharpeningValue = sharpeningValue,
+                noiseReductionValue = noiseReductionValue,
+                chromaNoiseReductionValue = chromaNoiseReductionValue,
+                linearInputToneMap = linearInputToneMap,
+                linearInputExposureEv = linearInputExposureEv,
+                naturalLightDefaultChromaDenoise = naturalLightDefaultChromaDenoise,
+                rawRenderingEngine = rawRenderingEngine,
+                rawHncsFilmCurveMode = rawHncsFilmCurveMode,
+                rawToneMappingParameters = rawToneMappingParameters
+            )
+            else -> applyLut(
+                bitmap = bitmap,
+                isHlgInput = isHlgInput,
+                lutConfig = creativeLayer?.lutConfig,
+                colorRecipeParams = creativeLayer?.colorRecipeParams,
+                sharpeningValue = sharpeningValue,
+                noiseReductionValue = noiseReductionValue,
+                chromaNoiseReductionValue = chromaNoiseReductionValue,
+                linearInputToneMap = linearInputToneMap,
+                linearInputExposureEv = linearInputExposureEv,
+                naturalLightDefaultChromaDenoise = naturalLightDefaultChromaDenoise,
+                rawRenderingEngine = rawRenderingEngine,
+                rawHncsFilmCurveMode = rawHncsFilmCurveMode,
+                rawToneMappingParameters = rawToneMappingParameters
+            )
+        }
+    }
+
+    
+    suspend fun applyLutStackWithLuminanceGain(
+        bitmap: Bitmap,
+        isHlgInput: Boolean = false,
+        baselineLayer: LutRenderLayer?,
+        creativeLayer: LutRenderLayer?,
+        sharpeningValue: Float = 0f,
+        noiseReductionValue: Float = 0f,
+        chromaNoiseReductionValue: Float = 0f,
+        linearInputToneMap: Boolean = false,
+        linearInputExposureEv: Float = 0f,
+        naturalLightDefaultChromaDenoise: Boolean = false,
+        rawRenderingEngine: RawRenderingEngine = RawRenderingEngine.AdobeCurve,
+        rawHncsFilmCurveMode: HncsFilmCurveMode = HncsFilmCurveMode.Standard,
+        rawToneMappingParameters: RawToneMappingParameters = RawToneMappingParameters.DEFAULT,
+        luminanceGainDownsample: Int = 1,
+    ): LutStackRenderResult {
+        val rendered = applyLutStack(
+            bitmap = bitmap,
+            isHlgInput = isHlgInput,
+            baselineLayer = baselineLayer,
+            creativeLayer = creativeLayer,
+            sharpeningValue = sharpeningValue,
+            noiseReductionValue = noiseReductionValue,
+            chromaNoiseReductionValue = chromaNoiseReductionValue,
+            linearInputToneMap = linearInputToneMap,
+            linearInputExposureEv = linearInputExposureEv,
+            naturalLightDefaultChromaDenoise = naturalLightDefaultChromaDenoise,
+            rawRenderingEngine = rawRenderingEngine,
+            rawHncsFilmCurveMode = rawHncsFilmCurveMode,
+            rawToneMappingParameters = rawToneMappingParameters,
+        )
+        val luminanceGainMap = if (isHlgInput || !bitmap.colorSpace.isEncodedSrgbFamily() ||
+            !rendered.colorSpace.isEncodedSrgbFamily()
+        ) {
+            PLog.e(
+                TAG,
+                "LUT luminance sidecar requires encoded sRGB input/output: " +
+                    "isHlg=$isHlgInput, before=${bitmap.colorSpace}, after=${rendered.colorSpace}"
+            )
+            null
+        } else withContext(glDispatcher) {
+            currentCoroutineContext().ensureActive()
+            if (!isInitialized || lutLuminanceGainProgram == 0) {
+                PLog.e(TAG, "Cannot create LUT luminance sidecar: GL program unavailable")
+                null
+            } else {
+                createLutLuminanceGainMap(bitmap, rendered, luminanceGainDownsample)
+            }
+        }
+        return LutStackRenderResult(rendered, luminanceGainMap)
+    }
+
+    private fun ColorSpace?.isEncodedSrgbFamily(): Boolean {
+        val colorSpaceId = this?.id ?: return false
+        return colorSpaceId == ColorSpace.get(ColorSpace.Named.SRGB).id ||
+            colorSpaceId == ColorSpace.get(ColorSpace.Named.EXTENDED_SRGB).id
+    }
+
+    private fun createLutLuminanceGainMap(
+        beforeLut: Bitmap,
+        afterLut: Bitmap,
+        downsample: Int,
+    ): Bitmap? {
+        if (beforeLut.width != afterLut.width || beforeLut.height != afterLut.height ||
+            beforeLut.width <= 0 || beforeLut.height <= 0
+        ) {
+            PLog.e(
+                TAG,
+                "LUT luminance sidecar inputs are not aligned: " +
+                    "before=${beforeLut.width}x${beforeLut.height}, " +
+                    "after=${afterLut.width}x${afterLut.height}"
+            )
+            return null
+        }
+        EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
+        val safeDownsample = downsample.coerceAtLeast(1)
+        val outputWidth = ((beforeLut.width + safeDownsample - 1) / safeDownsample).coerceAtLeast(1)
+        val outputHeight = ((beforeLut.height + safeDownsample - 1) / safeDownsample).coerceAtLeast(1)
+
+        val textures = IntArray(3)
+        val framebuffers = IntArray(1)
+        GLES30.glGenTextures(3, textures, 0)
+        GLES30.glGenFramebuffers(1, framebuffers, 0)
+        try {
+            uploadLuminanceSidecarInput(textures[0], beforeLut)
+            uploadLuminanceSidecarInput(textures[1], afterLut)
+
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, textures[2])
+            GLES30.glTexImage2D(
+                GLES30.GL_TEXTURE_2D,
+                0,
+                GLES30.GL_RGBA16F,
+                outputWidth,
+                outputHeight,
+                0,
+                GLES30.GL_RGBA,
+                GLES30.GL_HALF_FLOAT,
+                null,
+            )
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_NEAREST)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_NEAREST)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, framebuffers[0])
+            GLES30.glFramebufferTexture2D(
+                GLES30.GL_FRAMEBUFFER,
+                GLES30.GL_COLOR_ATTACHMENT0,
+                GLES30.GL_TEXTURE_2D,
+                textures[2],
+                0,
+            )
+            val framebufferStatus = GLES30.glCheckFramebufferStatus(GLES30.GL_FRAMEBUFFER)
+            if (framebufferStatus != GLES30.GL_FRAMEBUFFER_COMPLETE) {
+                PLog.e(TAG, "LUT luminance sidecar framebuffer incomplete: $framebufferStatus")
+                return null
+            }
+
+            GLES30.glViewport(0, 0, outputWidth, outputHeight)
+            GLES30.glUseProgram(lutLuminanceGainProgram)
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, textures[0])
+            GLES30.glUniform1i(
+                GLES30.glGetUniformLocation(lutLuminanceGainProgram, "uBeforeLutTexture"),
+                0,
+            )
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE1)
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, textures[1])
+            GLES30.glUniform1i(
+                GLES30.glGetUniformLocation(lutLuminanceGainProgram, "uAfterLutTexture"),
+                1,
+            )
+            GLES30.glUniform1f(
+                GLES30.glGetUniformLocation(lutLuminanceGainProgram, "uOffset"),
+                LUT_LUMINANCE_OFFSET,
+            )
+            drawQuad(lutLuminanceGainProgram)
+            checkGlError("renderLutLuminanceGainMap")
+
+            val byteCount = outputWidth.toLong() * outputHeight.toLong() * 8L
+            val readback = LargeDirectBuffer.allocate(byteCount, "LUT luminance gain RGBA16F")
+                ?: return null
+            try {
+                GLES30.glPixelStorei(GLES30.GL_PACK_ALIGNMENT, 4)
+                GLES30.glReadPixels(
+                    0,
+                    0,
+                    outputWidth,
+                    outputHeight,
+                    GLES30.GL_RGBA,
+                    GLES30.GL_HALF_FLOAT,
+                    readback,
+                )
+                checkGlError("readLutLuminanceGainMap")
+                readback.position(0)
+                return Bitmap.createBitmap(
+                    outputWidth,
+                    outputHeight,
+                    Bitmap.Config.RGBA_F16,
+                    true,
+                    ColorSpace.get(ColorSpace.Named.LINEAR_EXTENDED_SRGB),
+                ).also { it.copyPixelsFromBuffer(readback) }
+            } finally {
+                LargeDirectBuffer.free(readback)
+            }
+        } finally {
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+            GLES30.glDeleteFramebuffers(1, framebuffers, 0)
+            GLES30.glDeleteTextures(3, textures, 0)
+        }
+    }
+
+    private fun uploadLuminanceSidecarInput(textureId: Int, bitmap: Bitmap) {
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, textureId)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+        val uploadBitmap = bitmap.asGlUploadCompatibleBitmap()
+        android.opengl.GLUtils.texImage2D(GLES30.GL_TEXTURE_2D, 0, uploadBitmap, 0)
+        if (uploadBitmap !== bitmap) uploadBitmap.recycle()
+    }
+
+    suspend fun applyChromaDenoise(bitmap: Bitmap, strength: Float = 0.1f): Bitmap = withContext(glDispatcher) {
+        currentCoroutineContext().ensureActive()
+        if (!isInitialized) {
+            if (!initialize()) {
+                return@withContext bitmap
+            }
+        }
+
+        EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
+        val width = bitmap.width
+        val height = bitmap.height
+
+        setupFramebuffer(width, height)
+        uploadImageTexture(bitmap)
+
+        renderBitmapChromaDenoise(imageTextureId, width, height, strength)
+        performRender(
+            width = width,
+            height = height,
+            inputTextureId = bitmapDenoiseTexId[0],
+            inputColorSpace = bitmap.colorSpace ?: ColorSpace.get(ColorSpace.Named.SRGB),
+            isHlgInput = false,
+            lutConfig = null,
+            effectiveRecipeParams = null,
+            sharpening = 0f,
+            lutMaskType = 0
+        )
+    }
+
+    
+    private fun performRender(
+        width: Int,
+        height: Int,
+        inputTextureId: Int,
+        inputColorSpace: ColorSpace,
+        isHlgInput: Boolean,
+        lutConfig: LutConfig?,
+        effectiveRecipeParams: ColorRecipeParams?,
+        sharpening: Float,
+        lutMaskType: Int,
+    ): Bitmap {
+        val colorRecipeEnabled = effectiveRecipeParams != null && !effectiveRecipeParams.isDefault()
+        val exposure = effectiveRecipeParams?.exposure ?: 0f
+        val contrast = effectiveRecipeParams?.contrast ?: 1f
+        val saturation = effectiveRecipeParams?.saturation ?: 1f
+        val temperature = effectiveRecipeParams?.temperature ?: 0f
+        val tint = effectiveRecipeParams?.tint ?: 0f
+        val fade = effectiveRecipeParams?.fade ?: 0f
+        val vibrance = effectiveRecipeParams?.color ?: 0f
+        val highlights = effectiveRecipeParams?.highlights ?: 0f
+        val shadows = effectiveRecipeParams?.shadows ?: 0f
+        val toneToe = effectiveRecipeParams?.toneToe ?: 0f
+        val toneShoulder = effectiveRecipeParams?.toneShoulder ?: 0f
+        val tonePivot = effectiveRecipeParams?.tonePivot ?: 0f
+        val filmGrain = effectiveRecipeParams?.filmGrain ?: 0f
+        val vignette = effectiveRecipeParams?.vignette ?: 0f
+        val flash = effectiveRecipeParams?.flash ?: 0f
+        val bleachBypass = effectiveRecipeParams?.bleachBypass ?: 0f
+        val clarity = effectiveRecipeParams?.clarity ?: 0f
+        val bloom = effectiveRecipeParams?.bloom ?: 0f
+        val halation = 0f
+        val softLight = effectiveRecipeParams?.softLight ?: 0f
+        val redHalation = effectiveRecipeParams?.redHalation ?: 0f
+        val chromaticAberration = effectiveRecipeParams?.chromaticAberration ?: 0f
+        val noise = effectiveRecipeParams?.noise ?: 0f
+        val lowRes = effectiveRecipeParams?.lowRes ?: 0f
+        val intensity = effectiveRecipeParams?.lutIntensity ?: 1f
+        val lchAdjustments = ColorRecipeGl.lchAdjustments(effectiveRecipeParams)
+        val primaryCalibrationMatrix = CameraRawCalibrationMatrix.build(effectiveRecipeParams)
+        val program = shaderProgram
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, framebufferId)
+        GLES30.glViewport(0, 0, width, height)
+
+        
+        GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
+        GLES30.glUseProgram(program)
+
+        
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, inputTextureId)
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(program, "uImageTexture"), 0)
+
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE1)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_3D, lutTextureId)
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(program, "uLutTexture"), 1)
+
+        
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uLutSize"), lutConfig?.size?.toFloat() ?: 0f)
+        GLES30.glUniform1f(
+            GLES30.glGetUniformLocation(program, "uLutIntensity"),
+            if (lutConfig != null) intensity else 0f
+        )
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(program, "uLutEnabled"), if (lutConfig != null) 1 else 0)
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(program, "uLutMaskType"), lutMaskType)
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(program, "uLutCurve"), LutShaderMappings.transferCurveId(lutConfig?.curve))
+        GLES30.glUniform1i(
+            GLES30.glGetUniformLocation(program, "uLutColorSpace"),
+            lutConfig?.colorSpace?.let(LutShaderMappings::colorSpaceId) ?: 0
+        )
+
+        val inputColorSpaceId = if (inputColorSpace == ColorSpace.get(ColorSpace.Named.DISPLAY_P3)) 1 else 0
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(program, "uInputColorSpace"), inputColorSpaceId)
+        GLES30.glUniform1i(uIsHlgInputLoc, if (isHlgInput) 1 else 0)
+
+        
+        GLES30.glUniform1i(
+            GLES30.glGetUniformLocation(program, "uColorRecipeEnabled"),
+            if (colorRecipeEnabled) 1 else 0
+        )
+        if (colorRecipeEnabled) {
+            GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uExposure"), exposure)
+            GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uContrast"), contrast)
+            GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uSaturation"), saturation)
+            GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uTemperature"), temperature)
+            GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uTint"), tint)
+            GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uFade"), fade)
+            GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uVibrance"), vibrance)
+            ShadowsHighlightsShader.bindUniforms(program, highlights, shadows)
+            GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uToneToe"), toneToe)
+            GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uToneShoulder"), toneShoulder)
+            GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uTonePivot"), tonePivot)
+            GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uVignette"), vignette)
+            GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uFlash"), flash)
+            GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uBleachBypass"), bleachBypass)
+            GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uNoise"), noise)
+            GLES30.glUniform1f(
+                GLES30.glGetUniformLocation(program, "uNoiseSeed"),
+                (System.currentTimeMillis() % 10000) / 1000f
+            )
+            GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uLowRes"), lowRes)
+            GLES30.glUniform1f(
+                GLES30.glGetUniformLocation(program, "uAspectRatio"),
+                width.toFloat() / Math.max(1, height).toFloat()
+            )
+            GLES30.glUniform3f(
+                GLES30.glGetUniformLocation(program, "uGradingHues"),
+                effectiveRecipeParams.gradingShadowHue,
+                effectiveRecipeParams.gradingMidtoneHue,
+                effectiveRecipeParams.gradingHighlightHue
+            )
+            GLES30.glUniform3f(
+                GLES30.glGetUniformLocation(program, "uGradingAmounts"),
+                effectiveRecipeParams.gradingShadowAmount,
+                effectiveRecipeParams.gradingMidtoneAmount,
+                effectiveRecipeParams.gradingHighlightAmount
+            )
+            GLES30.glUniform3f(
+                GLES30.glGetUniformLocation(program, "uGradingLuminances"),
+                effectiveRecipeParams.gradingShadowLuminance,
+                effectiveRecipeParams.gradingMidtoneLuminance,
+                effectiveRecipeParams.gradingHighlightLuminance,
+            )
+            GLES30.glUniform1f(
+                GLES30.glGetUniformLocation(program, "uGradingBalance"),
+                effectiveRecipeParams.gradingBalance
+            )
+            GLES30.glUniform1f(
+                GLES30.glGetUniformLocation(program, "uGradingBlending"),
+                effectiveRecipeParams.gradingBlending
+            )
+            ColorRecipeGl.bindLchAdjustments(
+                uLchHueAdjustmentsLoc,
+                uLchChromaAdjustmentsLoc,
+                uLchLightnessAdjustmentsLoc,
+                lchAdjustments
+            )
+            GLES30.glUniformMatrix3fv(uPrimaryCalibrationMatrixLoc, 1, false, primaryCalibrationMatrix, 0)
+        }
+
+        
+        val masterPts = effectiveRecipeParams?.masterCurvePoints
+        val redPts = effectiveRecipeParams?.redCurvePoints
+        val greenPts = effectiveRecipeParams?.greenCurvePoints
+        val bluePts = effectiveRecipeParams?.blueCurvePoints
+        val curveActive = !CurveUtils.isIdentity(masterPts, redPts, greenPts, bluePts)
+        if (curveActive) {
+            val curveBuffer = CurveUtils.buildCurveTextureBuffer(masterPts, redPts, greenPts, bluePts)
+            curveTextureId = ColorRecipeGl.ensureCurveTextureUploaded(curveTextureId, curveBuffer)
+        }
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE3)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, if (curveActive) curveTextureId else 0)
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(program, "uCurveTexture"), 3)
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(program, "uCurveEnabled"), if (curveActive) 1 else 0)
+
+        basicToneTextures.bind(
+            context = appContext,
+            textureUnit = 6,
+            samplerLocation = GLES30.glGetUniformLocation(program, "uBasicToneLut"),
+            intensityLocation = GLES30.glGetUniformLocation(program, "uBasicToneIntensity"),
+            amount = effectiveRecipeParams?.let(ColorPaletteMapper::basicToneAmount) ?: 0f,
+        )
+
+        
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uHalation"), halation)
+        if (halation > 0f) {
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE2)
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, hdfTexId[1])
+            GLES30.glUniform1i(GLES30.glGetUniformLocation(program, "uHdfTexture"), 2)
+        }
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uSoftLight"), softLight)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE5)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, if (softLight > 0f) softLightTexId[1] else 0)
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(program, "uSoftLightTexture"), 5)
+
+        
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uRedHalation"), redHalation)
+        if (redHalation > 0f) {
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE4)
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, halationTexId[1])
+            GLES30.glUniform1i(GLES30.glGetUniformLocation(program, "uRedHalationTexture"), 4)
+        }
+
+        
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(program, "uChromaticAberration"), chromaticAberration)
+        GLES30.glUniform2f(GLES30.glGetUniformLocation(program, "uTexelSize"), 1.0f / width, 1.0f / height)
+
+        
+        val mvpMatrix = FloatArray(16)
+        android.opengl.Matrix.setIdentityM(mvpMatrix, 0)
+        GLES30.glUniformMatrix4fv(GLES30.glGetUniformLocation(program, "uMVPMatrix"), 1, false, mvpMatrix, 0)
+
+        
+        val positionHandle = GLES30.glGetAttribLocation(program, "aPosition")
+        val texCoordHandle = GLES30.glGetAttribLocation(program, "aTexCoord")
+
+        if (positionHandle >= 0) {
+            vertexBuffer?.let {
+                GLES30.glEnableVertexAttribArray(positionHandle)
+                it.position(0)
+                GLES30.glVertexAttribPointer(positionHandle, 2, GLES30.GL_FLOAT, false, 0, it)
+            }
+        }
+        if (texCoordHandle >= 0) {
+            texCoordBuffer?.let {
+                GLES30.glEnableVertexAttribArray(texCoordHandle)
+                it.position(0)
+                GLES30.glVertexAttribPointer(texCoordHandle, 2, GLES30.GL_FLOAT, false, 0, it)
+            }
+        }
+
+        indexBuffer?.let {
+            it.position(0)
+            GLES30.glDrawElements(GLES30.GL_TRIANGLES, 6, GLES30.GL_UNSIGNED_SHORT, it)
+        }
+
+        if (positionHandle >= 0) GLES30.glDisableVertexAttribArray(positionHandle)
+        if (texCoordHandle >= 0) GLES30.glDisableVertexAttribArray(texCoordHandle)
+
+        val clarityApplied = kotlin.math.abs(clarity) > 0.001f &&
+            renderClarity(outputTextureId, width, height, clarity)
+        val postClarityTextureId = if (clarityApplied) clarityOutputTextureId else outputTextureId
+        val postClarityFramebufferId = if (clarityApplied) clarityOutputFboId else framebufferId
+
+        val sharpened = sharpening > 0f &&
+            renderLutSharpenPass(postClarityTextureId, width, height, sharpening)
+        val postSharpenTextureId = if (sharpened) lutSharpenTextureId else postClarityTextureId
+        val postSharpenFramebufferId = if (sharpened) lutSharpenFboId else postClarityFramebufferId
+
+        val bloomApplied = bloom > 0.001f && renderLdrBloom(postSharpenTextureId, width, height, bloom)
+        val postBloomTextureId = if (bloomApplied) bloomOutputTextureId else postSharpenTextureId
+        val postBloomFramebufferId = if (bloomApplied) bloomOutputFboId else postSharpenFramebufferId
+        val filmGrainOutput = if (filmGrain > 0.001f) {
+            filmGrainGl.renderToTexture(
+                sourceTextureId = postBloomTextureId,
+                width = width,
+                height = height,
+                amount = filmGrain,
+                frameSeed = 0f,
+                drawQuad = ::drawQuad,
+            )
+        } else {
+            null
+        }
+        val readFramebufferId = filmGrainOutput?.framebufferId ?: postBloomFramebufferId
+
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, readFramebufferId)
+        val pixelSize = width * height * 4
+        val pixelBuffer = obtainReadbackBuffer(pixelSize)
+        GLES30.glBindBuffer(GLES30.GL_PIXEL_PACK_BUFFER, 0)
+        GLES30.glPixelStorei(GLES30.GL_PACK_ALIGNMENT, 4)
+        GLES30.glReadPixels(
+            0,
+            0,
+            width,
+            height,
+            GLES30.GL_RGBA,
+            GLES30.GL_UNSIGNED_BYTE,
+            pixelBuffer
+        )
+        pixelBuffer.position(0)
+
+        
+        val tempBitmap = createBitmap(width, height, colorSpace = inputColorSpace)
+        tempBitmap.copyPixelsFromBuffer(pixelBuffer)
+
+        
+
+        
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+
+        return tempBitmap
+    }
+
+    private fun setupFramebuffer(width: Int, height: Int) {
+        if (framebufferId != 0 &&
+            outputTextureId != 0 &&
+            outputFramebufferWidth == width &&
+            outputFramebufferHeight == height
+        ) {
+            return
+        }
+
+        releaseOutputFramebuffer()
+
+        
+        val textures = IntArray(1)
+        GLES30.glGenTextures(1, textures, 0)
+        outputTextureId = textures[0]
+
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, outputTextureId)
+        GLES30.glTexImage2D(
+            GLES30.GL_TEXTURE_2D, 0, GLES30.GL_RGBA, width, height, 0,
+            GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, null
+        )
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+
+        
+        val fbos = IntArray(1)
+        GLES30.glGenFramebuffers(1, fbos, 0)
+        framebufferId = fbos[0]
+
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, framebufferId)
+        GLES30.glFramebufferTexture2D(
+            GLES30.GL_FRAMEBUFFER, GLES30.GL_COLOR_ATTACHMENT0,
+            GLES30.GL_TEXTURE_2D, outputTextureId, 0
+        )
+
+        val status = GLES30.glCheckFramebufferStatus(GLES30.GL_FRAMEBUFFER)
+        if (status != GLES30.GL_FRAMEBUFFER_COMPLETE) {
+            PLog.e(TAG, "Framebuffer not complete: $status")
+        }
+
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+        outputFramebufferWidth = width
+        outputFramebufferHeight = height
+    }
+
+    private fun releaseOutputFramebuffer() {
+        if (framebufferId != 0) {
+            GLES30.glDeleteFramebuffers(1, intArrayOf(framebufferId), 0)
+            framebufferId = 0
+        }
+        if (outputTextureId != 0) {
+            GLES30.glDeleteTextures(1, intArrayOf(outputTextureId), 0)
+            outputTextureId = 0
+        }
+        outputFramebufferWidth = 0
+        outputFramebufferHeight = 0
+        releaseLutSharpenFramebuffer()
+    }
+
+    private fun renderNaturalLightToneMap(
+        inputTextureId: Int,
+        width: Int,
+        height: Int,
+        engine: RawRenderingEngine,
+        hncsFilmCurveMode: HncsFilmCurveMode,
+        toneMappingParameters: RawToneMappingParameters,
+        exposureCompensationEv: Float
+    ): Int {
+        val effectiveEngine = if (engine.isHncs) RawRenderingEngine.HncsCcm else engine
+        val program = getOrCreateNaturalLightProgram(effectiveEngine)
+        if (program == 0) return inputTextureId
+        setupNaturalLightFramebuffer(width, height)
+        if (naturalLightFboId == 0 || naturalLightTextureId == 0) return inputTextureId
+
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, naturalLightFboId)
+        GLES30.glViewport(0, 0, width, height)
+        GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
+        GLES30.glUseProgram(program)
+
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, inputTextureId)
+        setUniform1i(program, "uInputTexture", 0)
+        RawToneMappingGl.bindRawToneMappingUniforms(program, toneMappingParameters)
+        bindNaturalLightProfileExposureUniforms(program, effectiveEngine, exposureCompensationEv)
+        setUniform1f(program, "uBlacks", 0f)
+        setUniform1f(program, "uWhites", 0f)
+        bindNaturalLightColorTransforms(program, effectiveEngine)
+        if (effectiveEngine == RawRenderingEngine.AdobeCurve) {
+            bindNaturalLightDisabledDcpUniforms(program)
+            bindNaturalLightAdobeCurve(program, toneMappingParameters)
+        }
+        if (effectiveEngine == RawRenderingEngine.Spektrafilm) {
+            bindNaturalLightDummySpectralFilmUniforms(program)
+        }
+        if (effectiveEngine.isHncs) {
+            checkNotNull(naturalLightHncsGl) {
+                "HNCS Natural Light rendering requires an application Context"
+            }.bindCombinedResources(
+                program = program,
+                filmCurveMode = hncsFilmCurveMode,
+            )
+        }
+        val identityMatrix = FloatArray(16)
+        android.opengl.Matrix.setIdentityM(identityMatrix, 0)
+        GLES30.glUniformMatrix4fv(
+            GLES30.glGetUniformLocation(program, "uTexMatrix"),
+            1,
+            false,
+            identityMatrix,
+            0
+        )
+        
+        
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, inputTextureId)
+        setUniform1i(program, "uInputTexture", 0)
+        drawQuad(program)
+        val error = GLES30.glGetError()
+        if (error != GLES30.GL_NO_ERROR) {
+            PLog.e(TAG, "renderNaturalLightToneMap glError $error")
+            return inputTextureId
+        }
+        val outputTextureId = if (effectiveEngine.isHncs) {
+            renderNaturalLightHncsOutput(
+                inputTextureId = naturalLightTextureId,
+                width = width,
+                height = height,
+            )
+        } else {
+            renderNaturalLightSrgbOutput(
+                inputTextureId = naturalLightTextureId,
+                width = width,
+                height = height,
+            )
+        }
+        return if (outputTextureId != 0) outputTextureId else inputTextureId
+    }
+
+    private fun renderNaturalLightHncsOutput(
+        inputTextureId: Int,
+        width: Int,
+        height: Int,
+    ): Int {
+        val program = getOrCreateNaturalLightHncsOutputProgram()
+        if (program == 0) return 0
+        setupNaturalLightOutputFramebuffer(width, height)
+        if (naturalLightOutputFboId == 0 || naturalLightOutputTextureId == 0) return 0
+
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, naturalLightOutputFboId)
+        GLES30.glViewport(0, 0, width, height)
+        GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
+        GLES30.glUseProgram(program)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, inputTextureId)
+        setUniform1i(program, "uInputTexture", 0)
+        val outputTransform = RawToneMappingGl.computeWorkingToOutputTransform(
+            com.mega.filter.camera.raw.ColorSpace.HNCS,
+            com.mega.filter.camera.raw.ColorSpace.SRGB,
+        )
+        GLES30.glUniformMatrix3fv(
+            GLES30.glGetUniformLocation(program, "uHncsToLinearOutput"),
+            1,
+            false,
+            RawToneMappingGl.transposeMatrix3x3(outputTransform),
+            0,
+        )
+        setUniform1f(program, "uBlacks", 0f)
+        setUniform1f(program, "uWhites", 0f)
+        val identityMatrix = FloatArray(16)
+        android.opengl.Matrix.setIdentityM(identityMatrix, 0)
+        GLES30.glUniformMatrix4fv(
+            GLES30.glGetUniformLocation(program, "uTexMatrix"),
+            1,
+            false,
+            identityMatrix,
+            0,
+        )
+        drawQuad(program)
+        val error = GLES30.glGetError()
+        if (error != GLES30.GL_NO_ERROR) {
+            PLog.e(TAG, "renderNaturalLightHncsOutput glError $error")
+            return 0
+        }
+        return naturalLightOutputTextureId
+    }
+
+    private fun renderNaturalLightSrgbOutput(
+        inputTextureId: Int,
+        width: Int,
+        height: Int,
+    ): Int {
+        val program = getOrCreateNaturalLightSrgbOutputProgram()
+        if (program == 0) return 0
+        setupNaturalLightOutputFramebuffer(width, height)
+        if (naturalLightOutputFboId == 0 || naturalLightOutputTextureId == 0) return 0
+
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, naturalLightOutputFboId)
+        GLES30.glViewport(0, 0, width, height)
+        GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
+        GLES30.glUseProgram(program)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, inputTextureId)
+        setUniform1i(program, "uInputTexture", 0)
+        val identityMatrix = FloatArray(16)
+        android.opengl.Matrix.setIdentityM(identityMatrix, 0)
+        GLES30.glUniformMatrix4fv(
+            GLES30.glGetUniformLocation(program, "uTexMatrix"),
+            1,
+            false,
+            identityMatrix,
+            0,
+        )
+        drawQuad(program)
+        val error = GLES30.glGetError()
+        if (error != GLES30.GL_NO_ERROR) {
+            PLog.e(TAG, "renderNaturalLightSrgbOutput glError $error")
+            return 0
+        }
+        return naturalLightOutputTextureId
+    }
+
+    private fun getOrCreateNaturalLightProgram(engine: RawRenderingEngine): Int {
+        val cached = naturalLightPrograms[engine.ordinal]
+        if (cached != 0) return cached
+        val vertexShader = compileShader(GLES30.GL_VERTEX_SHADER, RawFullscreenQuad.VERTEX_SHADER)
+        val fragmentShader = compileShader(
+            GLES30.GL_FRAGMENT_SHADER,
+            RawEngineTonePass.combinedFragmentShaderFor(engine, includeShadowsHighlights = false)
+        )
+        if (vertexShader == 0 || fragmentShader == 0) {
+            if (vertexShader != 0) GLES30.glDeleteShader(vertexShader)
+            if (fragmentShader != 0) GLES30.glDeleteShader(fragmentShader)
+            return 0
+        }
+        val program = GLES30.glCreateProgram()
+        GLES30.glAttachShader(program, vertexShader)
+        GLES30.glAttachShader(program, fragmentShader)
+        GLES30.glLinkProgram(program)
+        GLES30.glDeleteShader(vertexShader)
+        GLES30.glDeleteShader(fragmentShader)
+        val linked = IntArray(1)
+        GLES30.glGetProgramiv(program, GLES30.GL_LINK_STATUS, linked, 0)
+        if (linked[0] == 0) {
+            PLog.e(TAG, "Natural light program link failed: ${GLES30.glGetProgramInfoLog(program)}")
+            GLES30.glDeleteProgram(program)
+            return 0
+        }
+        naturalLightPrograms[engine.ordinal] = program
+        return program
+    }
+
+    private fun getOrCreateNaturalLightHncsOutputProgram(): Int {
+        if (naturalLightHncsOutputProgram != 0) return naturalLightHncsOutputProgram
+        naturalLightHncsOutputProgram = createFragmentProgram(
+            RawFullscreenQuad.VERTEX_SHADER,
+            HncsNaturalLightOutputPassShaders.FRAGMENT_SHADER,
+            "NaturalLight_HncsOutput",
+        )
+        return naturalLightHncsOutputProgram
+    }
+
+    private fun getOrCreateNaturalLightSrgbOutputProgram(): Int {
+        if (naturalLightSrgbOutputProgram != 0) return naturalLightSrgbOutputProgram
+        naturalLightSrgbOutputProgram = createFragmentProgram(
+            RawFullscreenQuad.VERTEX_SHADER,
+            RawSrgbPass.FRAGMENT_SHADER,
+            "NaturalLight_SrgbOutput",
+        )
+        return naturalLightSrgbOutputProgram
+    }
+
+    private fun setupNaturalLightFramebuffer(width: Int, height: Int) {
+        if (naturalLightTextureId != 0 &&
+            naturalLightFboId != 0 &&
+            naturalLightWidth == width &&
+            naturalLightHeight == height
+        ) {
+            return
+        }
+        releaseNaturalLightFramebuffer()
+
+        val textures = IntArray(1)
+        GLES30.glGenTextures(1, textures, 0)
+        naturalLightTextureId = textures[0]
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, naturalLightTextureId)
+        GLES30.glTexImage2D(
+            GLES30.GL_TEXTURE_2D,
+            0,
+            GLES30.GL_RGBA16F,
+            width,
+            height,
+            0,
+            GLES30.GL_RGBA,
+            GLES30.GL_FLOAT,
+            null
+        )
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+
+        val fbos = IntArray(1)
+        GLES30.glGenFramebuffers(1, fbos, 0)
+        naturalLightFboId = fbos[0]
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, naturalLightFboId)
+        GLES30.glFramebufferTexture2D(
+            GLES30.GL_FRAMEBUFFER,
+            GLES30.GL_COLOR_ATTACHMENT0,
+            GLES30.GL_TEXTURE_2D,
+            naturalLightTextureId,
+            0
+        )
+        val status = GLES30.glCheckFramebufferStatus(GLES30.GL_FRAMEBUFFER)
+        if (status != GLES30.GL_FRAMEBUFFER_COMPLETE) {
+            PLog.e(TAG, "Natural light framebuffer not complete: $status")
+            releaseNaturalLightFramebuffer()
+            return
+        }
+        naturalLightWidth = width
+        naturalLightHeight = height
+    }
+
+    private fun releaseNaturalLightFramebuffer() {
+        if (naturalLightFboId != 0) {
+            GLES30.glDeleteFramebuffers(1, intArrayOf(naturalLightFboId), 0)
+            naturalLightFboId = 0
+        }
+        if (naturalLightTextureId != 0) {
+            GLES30.glDeleteTextures(1, intArrayOf(naturalLightTextureId), 0)
+            naturalLightTextureId = 0
+        }
+        naturalLightWidth = 0
+        naturalLightHeight = 0
+    }
+
+    private fun setupNaturalLightOutputFramebuffer(width: Int, height: Int) {
+        if (naturalLightOutputTextureId != 0 &&
+            naturalLightOutputFboId != 0 &&
+            naturalLightOutputWidth == width &&
+            naturalLightOutputHeight == height
+        ) {
+            return
+        }
+        releaseNaturalLightOutputFramebuffer()
+
+        val textures = IntArray(1)
+        GLES30.glGenTextures(1, textures, 0)
+        naturalLightOutputTextureId = textures[0]
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, naturalLightOutputTextureId)
+        GLES30.glTexImage2D(
+            GLES30.GL_TEXTURE_2D,
+            0,
+            GLES30.GL_RGBA16F,
+            width,
+            height,
+            0,
+            GLES30.GL_RGBA,
+            GLES30.GL_FLOAT,
+            null,
+        )
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+
+        val framebuffers = IntArray(1)
+        GLES30.glGenFramebuffers(1, framebuffers, 0)
+        naturalLightOutputFboId = framebuffers[0]
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, naturalLightOutputFboId)
+        GLES30.glFramebufferTexture2D(
+            GLES30.GL_FRAMEBUFFER,
+            GLES30.GL_COLOR_ATTACHMENT0,
+            GLES30.GL_TEXTURE_2D,
+            naturalLightOutputTextureId,
+            0,
+        )
+        val status = GLES30.glCheckFramebufferStatus(GLES30.GL_FRAMEBUFFER)
+        if (status != GLES30.GL_FRAMEBUFFER_COMPLETE) {
+            PLog.e(TAG, "Natural Light output framebuffer not complete: $status")
+            releaseNaturalLightOutputFramebuffer()
+            return
+        }
+        naturalLightOutputWidth = width
+        naturalLightOutputHeight = height
+    }
+
+    private fun releaseNaturalLightOutputFramebuffer() {
+        if (naturalLightOutputFboId != 0) {
+            GLES30.glDeleteFramebuffers(
+                1,
+                intArrayOf(naturalLightOutputFboId),
+                0,
+            )
+            naturalLightOutputFboId = 0
+        }
+        if (naturalLightOutputTextureId != 0) {
+            GLES30.glDeleteTextures(
+                1,
+                intArrayOf(naturalLightOutputTextureId),
+                0,
+            )
+            naturalLightOutputTextureId = 0
+        }
+        naturalLightOutputWidth = 0
+        naturalLightOutputHeight = 0
+    }
+
+    private fun bindNaturalLightColorTransforms(program: Int, engine: RawRenderingEngine) {
+        val profileToEngine = RawToneMappingGl.computeWorkingToOutputTransform(
+            com.mega.filter.camera.raw.ColorSpace.SRGB,
+            engine.workingColorSpace
+        )
+        val outputTransform = RawToneMappingGl.computeWorkingToOutputTransform(
+            engine.workingColorSpace,
+            com.mega.filter.camera.raw.ColorSpace.SRGB
+        )
+        GLES30.glUniformMatrix3fv(
+            GLES30.glGetUniformLocation(program, "uProfileToEngineTransform"),
+            1,
+            false,
+            RawToneMappingGl.transposeMatrix3x3(profileToEngine),
+            0
+        )
+        GLES30.glUniformMatrix3fv(
+            GLES30.glGetUniformLocation(program, "uOutputTransform"),
+            1,
+            false,
+            RawToneMappingGl.transposeMatrix3x3(outputTransform),
+            0
+        )
+    }
+
+    private fun bindNaturalLightProfileExposureUniforms(
+        program: Int,
+        engine: RawRenderingEngine,
+        exposureCompensationEv: Float
+    ) {
+        val exposure = RawProfileExposureGl.compute(
+            profileExposureCompensation = exposureCompensationEv + engine.defaultExposureCompensationEv,
+            useRamp = engine == RawRenderingEngine.AdobeCurve
+        )
+        RawProfileExposureGl.bindUniforms(program, exposure)
+    }
+
+    private fun bindNaturalLightDisabledDcpUniforms(program: Int) {
+        val dummyTextureId = ensureNaturalLightDummy3DTexture()
+        setUniform1i(program, "uDcpHueSatTexture", 2)
+        setUniform1i(program, "uDcpLookTableTexture", 3)
+        setUniform1i(program, "uDcpHueSatEnabled", 0)
+        setUniform1i(program, "uDcpLookTableEnabled", 0)
+        setUniform3i(program, "uDcpHueSatDivisions", 1, 1, 1)
+        setUniform3i(program, "uDcpLookTableDivisions", 1, 1, 1)
+        setUniform1i(program, "uDcpHueSatEncoding", 0)
+        setUniform1i(program, "uDcpLookTableEncoding", 0)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE2)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_3D, dummyTextureId)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE3)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_3D, dummyTextureId)
+    }
+
+    private fun bindNaturalLightAdobeCurve(
+        program: Int,
+        toneMappingParameters: RawToneMappingParameters
+    ) {
+        val curve = RawToneMappingGl.adobeCurveSamplesFor(toneMappingParameters)
+        uploadNaturalLightCurveTexture(curve)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE1)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, naturalLightCurveTextureId)
+        setUniform1i(program, "uCurveTexture", 1)
+        setUniform1f(program, "uCurveSize", curve.size.toFloat())
+        setUniform1i(program, "uCurveEnabled", 1)
+    }
+
+    private fun bindNaturalLightDummySpectralFilmUniforms(program: Int) {
+        setUniform1i(program, "uSpectralFilmTexture", 6)
+        setUniform1i(program, "uSpectralFilmSize", 1)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE6)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_3D, ensureNaturalLightDummy3DTexture())
+    }
+
+    private fun uploadNaturalLightCurveTexture(curve: FloatArray) {
+        if (naturalLightCurveTextureId != 0 && naturalLightCurveSize == curve.size) return
+        if (naturalLightCurveTextureId == 0) {
+            val textures = IntArray(1)
+            GLES30.glGenTextures(1, textures, 0)
+            naturalLightCurveTextureId = textures[0]
+        }
+        val buffer = ByteBuffer.allocateDirect(curve.size * 4)
+            .order(ByteOrder.nativeOrder())
+            .asFloatBuffer()
+        buffer.put(curve)
+        buffer.position(0)
+
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, naturalLightCurveTextureId)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glTexImage2D(
+            GLES30.GL_TEXTURE_2D,
+            0,
+            GLES30.GL_R16F,
+            curve.size,
+            1,
+            0,
+            GLES30.GL_RED,
+            GLES30.GL_FLOAT,
+            buffer
+        )
+        naturalLightCurveSize = curve.size
+    }
+
+    private fun ensureNaturalLightDummy3DTexture(): Int {
+        if (naturalLightDummy3DTextureId != 0) return naturalLightDummy3DTextureId
+        val textures = IntArray(1)
+        GLES30.glGenTextures(1, textures, 0)
+        naturalLightDummy3DTextureId = textures[0]
+        val buffer = ByteBuffer.allocateDirect(4 * 4)
+            .order(ByteOrder.nativeOrder())
+            .asFloatBuffer()
+        buffer.put(floatArrayOf(0f, 1f, 1f, 1f))
+        buffer.position(0)
+
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_3D, naturalLightDummy3DTextureId)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_3D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_NEAREST)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_3D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_NEAREST)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_3D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_3D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_3D, GLES30.GL_TEXTURE_WRAP_R, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glTexImage3D(
+            GLES30.GL_TEXTURE_3D,
+            0,
+            GLES30.GL_RGBA16F,
+            1,
+            1,
+            1,
+            0,
+            GLES30.GL_RGBA,
+            GLES30.GL_FLOAT,
+            buffer
+        )
+        return naturalLightDummy3DTextureId
+    }
+
+    private fun setUniform1i(program: Int, name: String, value: Int) {
+        val location = GLES30.glGetUniformLocation(program, name)
+        if (location >= 0) GLES30.glUniform1i(location, value)
+    }
+
+    private fun setUniform1f(program: Int, name: String, value: Float) {
+        val location = GLES30.glGetUniformLocation(program, name)
+        if (location >= 0) GLES30.glUniform1f(location, value)
+    }
+
+    private fun setUniform3i(program: Int, name: String, x: Int, y: Int, z: Int) {
+        val location = GLES30.glGetUniformLocation(program, name)
+        if (location >= 0) GLES30.glUniform3i(location, x, y, z)
+    }
+
+    private fun obtainReadbackBuffer(pixelSize: Int): ByteBuffer {
+        val current = readbackBuffer
+        if (current != null && readbackBufferSize >= pixelSize) {
+            current.clear()
+            current.limit(pixelSize)
+            return current
+        }
+        releaseReadbackBuffer()
+        return (com.mega.filter.camera.utils.DirectBufferAllocator.allocateNative(pixelSize.toLong())
+            ?.order(ByteOrder.nativeOrder())
+            ?: throw OutOfMemoryError("Failed to allocate native direct buffer")).also {
+            readbackBuffer = it
+            readbackBufferSize = pixelSize
+        }
+    }
+
+    private fun releaseReadbackBuffer() {
+        readbackBuffer?.let { com.mega.filter.camera.utils.DirectBufferAllocator.freeNative(it) }
+        readbackBuffer = null
+        readbackBufferSize = 0
+    }
+
+    private fun uploadImageTexture(bitmap: Bitmap) {
+        if (imageTextureId == 0) {
+            val textures = IntArray(1)
+            GLES30.glGenTextures(1, textures, 0)
+            imageTextureId = textures[0]
+        }
+
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, imageTextureId)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+
+        val uploadBitmap = bitmap.asGlUploadCompatibleBitmap()
+        android.opengl.GLUtils.texImage2D(GLES30.GL_TEXTURE_2D, 0, uploadBitmap, 0)
+        if (uploadBitmap !== bitmap) {
+            uploadBitmap.recycle()
+        }
+    }
+
+    private fun Bitmap.asGlUploadCompatibleBitmap(): Bitmap {
+        if (config == Bitmap.Config.ARGB_8888 || config == Bitmap.Config.RGB_565) return this
+        return runCatching { copy(Bitmap.Config.ARGB_8888, false) }.getOrNull()
+            ?: runCatching {
+                Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also { converted ->
+                    android.graphics.Canvas(converted).drawBitmap(this, 0f, 0f, null)
+                }
+            }.getOrNull()
+            ?: this
+    }
+
+    private fun uploadImageTextureFromArgb(argbData: ShortBuffer, width: Int, height: Int) {
+        if (imageTextureId == 0) {
+            val textures = IntArray(1)
+            GLES30.glGenTextures(1, textures, 0)
+            imageTextureId = textures[0]
+        }
+
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, imageTextureId)
+        
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_NEAREST)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_NEAREST)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+
+        
+        
+        GLES30.glTexImage2D(
+            GLES30.GL_TEXTURE_2D, 0, GLES30.GL_RGBA16F,
+            width, height, 0,
+            GLES30.GL_RGBA, GLES30.GL_HALF_FLOAT, argbData
+        )
+
+        val error = GLES30.glGetError()
+        if (error != GLES30.GL_NO_ERROR) {
+            PLog.e(TAG, "glTexImage2D error: $error")
+        }
+    }
+
+    private fun uploadLutTexture(lutConfig: LutConfig) {
+        if (lutTextureId == 0) {
+            val textures = IntArray(1)
+            GLES30.glGenTextures(1, textures, 0)
+            lutTextureId = textures[0]
+        }
+
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_3D, lutTextureId)
+
+        
+        GLES30.glPixelStorei(GLES30.GL_UNPACK_ALIGNMENT, 1)
+
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_3D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_3D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_3D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_3D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_3D, GLES30.GL_TEXTURE_WRAP_R, GLES30.GL_CLAMP_TO_EDGE)
+
+        val buffer: java.nio.Buffer
+        val internalFormat: Int
+        val format: Int
+        val type: Int
+
+        if (lutConfig.configDataType == LutConfig.CONFIG_DATA_TYPE_UINT16) {
+            buffer = lutConfig.toFloatBuffer()
+            internalFormat = GLES30.GL_RGB16F
+            format = GLES30.GL_RGB
+            type = GLES30.GL_FLOAT
+        } else {
+            buffer = lutConfig.toByteBuffer()
+            internalFormat = GLES30.GL_RGB8
+            format = GLES30.GL_RGB
+            type = GLES30.GL_UNSIGNED_BYTE
+        }
+
+        GLES30.glTexImage3D(
+            GLES30.GL_TEXTURE_3D, 0, internalFormat,
+            lutConfig.size, lutConfig.size, lutConfig.size,
+            0, format, type, buffer
+        )
+
+        
+        GLES30.glPixelStorei(GLES30.GL_UNPACK_ALIGNMENT, 4)
+    }
+
+    private fun initShaderProgram() {
+        val vertexShader = compileShader(GLES30.GL_VERTEX_SHADER, IMAGE_VERTEX_SHADER)
+        val fragmentShader = compileShader(GLES30.GL_FRAGMENT_SHADER, IMAGE_FRAGMENT_SHADER_COLOR_RECIPE)
+
+        shaderProgram = GLES30.glCreateProgram()
+        GLES30.glAttachShader(shaderProgram, vertexShader)
+        GLES30.glAttachShader(shaderProgram, fragmentShader)
+        GLES30.glLinkProgram(shaderProgram)
+
+        
+        uImageTextureLoc = GLES30.glGetUniformLocation(shaderProgram, "uImageTexture")
+        uLutTextureLoc = GLES30.glGetUniformLocation(shaderProgram, "uLutTexture")
+        uLutSizeLoc = GLES30.glGetUniformLocation(shaderProgram, "uLutSize")
+        uLutIntensityLoc = GLES30.glGetUniformLocation(shaderProgram, "uLutIntensity")
+        uLutEnabledLoc = GLES30.glGetUniformLocation(shaderProgram, "uLutEnabled")
+        uLutCurveLoc = GLES30.glGetUniformLocation(shaderProgram, "uLutCurve")
+        uLutColorSpaceLoc = GLES30.glGetUniformLocation(shaderProgram, "uLutColorSpace")
+        uInputColorSpaceLoc = GLES30.glGetUniformLocation(shaderProgram, "uInputColorSpace")
+        uIsHlgInputLoc = GLES30.glGetUniformLocation(shaderProgram, "uIsHlgInput")
+        uMVPMatrixLoc = GLES30.glGetUniformLocation(shaderProgram, "uMVPMatrix")
+
+        
+        uColorRecipeEnabledLoc = GLES30.glGetUniformLocation(shaderProgram, "uColorRecipeEnabled")
+        uExposureLoc = GLES30.glGetUniformLocation(shaderProgram, "uExposure")
+        uContrastLoc = GLES30.glGetUniformLocation(shaderProgram, "uContrast")
+        uSaturationLoc = GLES30.glGetUniformLocation(shaderProgram, "uSaturation")
+        uTemperatureLoc = GLES30.glGetUniformLocation(shaderProgram, "uTemperature")
+        uTintLoc = GLES30.glGetUniformLocation(shaderProgram, "uTint")
+        uFadeLoc = GLES30.glGetUniformLocation(shaderProgram, "uFade")
+        uVibranceLoc = GLES30.glGetUniformLocation(shaderProgram, "uVibrance")
+        uHighlightsLoc = GLES30.glGetUniformLocation(shaderProgram, "uHighlights")
+        uShadowsLoc = GLES30.glGetUniformLocation(shaderProgram, "uShadows")
+        uToneToeLoc = GLES30.glGetUniformLocation(shaderProgram, "uToneToe")
+        uToneShoulderLoc = GLES30.glGetUniformLocation(shaderProgram, "uToneShoulder")
+        uTonePivotLoc = GLES30.glGetUniformLocation(shaderProgram, "uTonePivot")
+        uVignetteLoc = GLES30.glGetUniformLocation(shaderProgram, "uVignette")
+        uBleachBypassLoc = GLES30.glGetUniformLocation(shaderProgram, "uBleachBypass")
+        uNoiseLoc = GLES30.glGetUniformLocation(shaderProgram, "uNoise")
+        uNoiseSeedLoc = GLES30.glGetUniformLocation(shaderProgram, "uNoiseSeed")
+        uLowResLoc = GLES30.glGetUniformLocation(shaderProgram, "uLowRes")
+        uAspectRatioLoc = GLES30.glGetUniformLocation(shaderProgram, "uAspectRatio")
+        uLchHueAdjustmentsLoc = GLES30.glGetUniformLocation(shaderProgram, "uLchHueAdjustments")
+        uLchChromaAdjustmentsLoc = GLES30.glGetUniformLocation(shaderProgram, "uLchChromaAdjustments")
+        uLchLightnessAdjustmentsLoc = GLES30.glGetUniformLocation(shaderProgram, "uLchLightnessAdjustments")
+        uPrimaryCalibrationMatrixLoc = GLES30.glGetUniformLocation(shaderProgram, "uPrimaryCalibrationMatrix")
+        lutLuminanceGainProgram = createFragmentProgram(
+            Shaders.SIMPLE_VERTEX_SHADER,
+            LUT_LUMINANCE_GAIN_SHADER,
+            "LutLuminanceGain",
+        )
+    }
+
+    private fun initBitmapDenoiseProfilePrograms() {
+        bitmapDenoisePreconditionProgram = compileComputeProgram(DenoiseProfileShaders.PRECONDITION_V2, "BitmapDenoise_PreconditionV2")
+        bitmapDenoiseNlmInitProgram = compileComputeProgram(DenoiseProfileShaders.INIT, "BitmapDenoise_NLM_Init")
+        bitmapDenoiseNlmFusedAccuProgram = compileComputeProgram(DenoiseProfileShaders.FUSED_ACCU, "BitmapDenoise_NLM_FusedAccu")
+        bitmapDenoiseNlmFinishProgram = compileComputeProgram(DenoiseProfileShaders.FINISH_V2, "BitmapDenoise_NLM_FinishV2")
+        bitmapDenoisePassthroughProgram = createFragmentProgram(IMAGE_VERTEX_SHADER, TEXTURE_PASSTHROUGH_SHADER, "BitmapDenoise_Passthrough")
+        naturalLightSrgbToLinearProgram = createFragmentProgram(IMAGE_VERTEX_SHADER, SRGB_TO_LINEAR_SHADER, "NaturalLight_SrgbToLinear")
+        bitmapChromaDenoiseGuideProgram = createFragmentProgram(IMAGE_VERTEX_SHADER, ChromaDenoiseShaders.PASS_EDGE_GUIDE, "BitmapChromaDenoise_EdgeGuide")
+        bitmapChromaDenoiseProgram = createFragmentProgram(IMAGE_VERTEX_SHADER, ChromaDenoiseShaders.PASS_CHROMA_DENOISE, "BitmapChromaDenoise_MultiScale")
+        lutSharpenProgram = createFragmentProgram(
+            IMAGE_VERTEX_SHADER,
+            RawSharpenPass.FRAGMENT_SHADER,
+            "LutSharpen",
+        )
+        PLog.d(
+            TAG,
+            "Bitmap denoiseprofile programs initialized: pre=$bitmapDenoisePreconditionProgram " +
+                "init=$bitmapDenoiseNlmInitProgram fusedAccu=$bitmapDenoiseNlmFusedAccuProgram " +
+                "finish=$bitmapDenoiseNlmFinishProgram " +
+                "pass=$bitmapDenoisePassthroughProgram linearize=$naturalLightSrgbToLinearProgram " +
+                "chromaGuide=$bitmapChromaDenoiseGuideProgram " +
+                "chroma=$bitmapChromaDenoiseProgram " +
+                "sharpen=$lutSharpenProgram"
+        )
+    }
+
+    private fun initHDFPrograms() {
+        fun createProgram(vShader: Int, fSource: String): Int {
+            val fShader = compileShader(GLES30.GL_FRAGMENT_SHADER, fSource)
+            if (vShader == 0 || fShader == 0) return 0
+            val program = GLES30.glCreateProgram()
+            GLES30.glAttachShader(program, vShader)
+            GLES30.glAttachShader(program, fShader)
+            GLES30.glLinkProgram(program)
+            GLES30.glDeleteShader(fShader)
+            return program
+        }
+
+        val imageVShader = compileShader(GLES30.GL_VERTEX_SHADER, IMAGE_VERTEX_SHADER)
+        hdfExtractBlurHProgram = createProgram(imageVShader, HDF_EXTRACT_BLUR_H_SHADER)
+        hdfBlurVProgram = createProgram(imageVShader, HDF_BLUR_V_SHADER)
+        softLightBlurHProgram = createProgram(imageVShader, Shaders.SOFT_LIGHT_PREVIEW_BLUR_H)
+        halationExtractBlurHProgram = createProgram(imageVShader, HALATION_EXTRACT_BLUR_H_SHADER)
+        halationBlurVProgram = createProgram(imageVShader, HDF_BLUR_V_SHADER)
+        GLES30.glDeleteShader(imageVShader)
+
+        val simpleVShader = compileShader(GLES30.GL_VERTEX_SHADER, Shaders.SIMPLE_VERTEX_SHADER)
+        bloomDownsampleFirstProgram = createProgram(simpleVShader, Shaders.BEVY_BLOOM_DOWNSAMPLE_FIRST)
+        bloomDownsampleProgram = createProgram(simpleVShader, Shaders.BEVY_BLOOM_DOWNSAMPLE)
+        bloomUpsampleProgram = createProgram(simpleVShader, Shaders.BEVY_BLOOM_UPSAMPLE)
+        bloomCompositeProgram = createProgram(simpleVShader, Shaders.BEVY_BLOOM_COMPOSITE)
+        GLES30.glDeleteShader(simpleVShader)
+
+        PLog.d(
+            TAG,
+            "HDF/Halation/Bloom/SoftLight programs initialized"
+        )
+    }
+
+    private fun initClarityPrograms() {
+        clarityDownsampleProgram = createFragmentProgram(
+            IMAGE_VERTEX_SHADER,
+            ClarityShaders.DOWNSAMPLE,
+            "ClarityDownsample",
+        )
+        clarityCompositeProgram = createFragmentProgram(
+            IMAGE_VERTEX_SHADER,
+            ClarityShaders.COMPOSITE,
+            "ClarityComposite",
+        )
+        PLog.d(
+            TAG,
+            "Static clarity programs initialized: " +
+                "downsample=$clarityDownsampleProgram composite=$clarityCompositeProgram",
+        )
+    }
+
+    private fun setupBitmapDenoiseFramebuffers(width: Int, height: Int) {
+        if (bitmapDenoiseWidth == width && bitmapDenoiseHeight == height && bitmapDenoiseTexId[0] != 0) return
+        bitmapDenoiseWidth = width
+        bitmapDenoiseHeight = height
+
+        for (i in 0..1) {
+            if (bitmapDenoiseTexId[i] != 0) GLES30.glDeleteTextures(1, intArrayOf(bitmapDenoiseTexId[i]), 0)
+            if (bitmapDenoiseFboId[i] != 0) GLES30.glDeleteFramebuffers(1, intArrayOf(bitmapDenoiseFboId[i]), 0)
+        }
+
+        for (i in 0..1) {
+            val t = IntArray(1)
+            val f = IntArray(1)
+            GLES30.glGenTextures(1, t, 0)
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, t[0])
+            GLES30.glTexStorage2D(GLES30.GL_TEXTURE_2D, 1, GLES30.GL_RGBA16F, width, height)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_NEAREST)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_NEAREST)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+            GLES30.glGenFramebuffers(1, f, 0)
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, f[0])
+            GLES30.glFramebufferTexture2D(
+                GLES30.GL_FRAMEBUFFER,
+                GLES30.GL_COLOR_ATTACHMENT0,
+                GLES30.GL_TEXTURE_2D,
+                t[0],
+                0
+            )
+            bitmapDenoiseTexId[i] = t[0]
+            bitmapDenoiseFboId[i] = f[0]
+
+            val status = GLES30.glCheckFramebufferStatus(GLES30.GL_FRAMEBUFFER)
+            if (status != GLES30.GL_FRAMEBUFFER_COMPLETE) {
+                PLog.e(TAG, "Bitmap denoiseprofile FBO $i incomplete: $status")
+            }
+        }
+        setupBitmapDenoiseResources(width, height)
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+    }
+
+    private fun renderBitmapDenoiseProfile(
+        sourceTextureId: Int,
+        width: Int,
+        height: Int,
+        noiseReduction: Float
+    ) {
+        setupBitmapDenoiseFramebuffers(width, height)
+
+        val strength = DenoiseStrength.clamp(noiseReduction)
+        if (strength <= 0f || width * height < 2) {
+            renderTexturePassthrough(sourceTextureId, bitmapDenoiseFboId[1], width, height)
+            return
+        }
+        if (!isBitmapDenoiseProfileReady()) {
+            renderTexturePassthrough(sourceTextureId, bitmapDenoiseFboId[1], width, height)
+            return
+        }
+
+        val preconditionTextureId = if (sourceTextureId == bitmapDenoiseTexId[0]) {
+            bitmapDenoiseTexId[1]
+        } else {
+            bitmapDenoiseTexId[0]
+        }
+        val params = buildBitmapDenoiseParams(strength)
+        dispatchBitmapDenoisePreconditionV2(sourceTextureId, preconditionTextureId, width, height, params)
+        dispatchBitmapDenoiseNlm(sourceTextureId, preconditionTextureId, bitmapDenoiseTexId[1], width, height, params)
+        checkGlError("renderBitmapDenoiseProfile")
+    }
+
+    private fun renderBitmapChromaDenoise(
+        sourceTextureId: Int,
+        width: Int,
+        height: Int,
+        chromaNoiseReduction: Float,
+        targetIndex: Int = 0
+    ) {
+        setupBitmapDenoiseFramebuffers(width, height)
+
+        val strength = DenoiseStrength.clamp(chromaNoiseReduction)
+        val target = targetIndex.coerceIn(0, bitmapDenoiseTexId.lastIndex)
+        val edgeGuidanceRelaxation =
+            ChromaDenoiseDefaults.edgeGuidanceRelaxation(strength)
+        if (strength <= 0f || bitmapChromaDenoiseProgram == 0 ||
+            bitmapChromaDenoiseGuideProgram == 0
+        ) {
+            renderTexturePassthrough(sourceTextureId, bitmapDenoiseFboId[target], width, height)
+            return
+        }
+
+        val identityMatrix = FloatArray(16)
+        android.opengl.Matrix.setIdentityM(identityMatrix, 0)
+        val h = ChromaDenoiseDefaults.noiseBandwidth(strength)
+        val guideIndex = if (target == 0) 1 else 0
+        renderBitmapChromaDenoiseEdgeGuide(
+            sourceTextureId,
+            bitmapDenoiseFboId[guideIndex],
+            width,
+            height
+        )
+        val guideTextureId = bitmapDenoiseTexId[guideIndex]
+
+        GLES30.glUseProgram(bitmapChromaDenoiseProgram)
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, bitmapDenoiseFboId[target])
+        GLES30.glViewport(0, 0, width, height)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, sourceTextureId)
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(bitmapChromaDenoiseProgram, "uInputTexture"), 0)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE1)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, guideTextureId)
+        GLES30.glUniform1i(
+            GLES30.glGetUniformLocation(bitmapChromaDenoiseProgram, "uGuideTexture"),
+            1
+        )
+        GLES30.glUniform2f(
+            GLES30.glGetUniformLocation(bitmapChromaDenoiseProgram, "uTexelSize"),
+            1.0f / width,
+            1.0f / height
+        )
+        GLES30.glUniformMatrix4fv(
+            GLES30.glGetUniformLocation(bitmapChromaDenoiseProgram, "uMVPMatrix"),
+            1,
+            false,
+            identityMatrix,
+            0
+        )
+        GLES30.glUniform1f(
+            GLES30.glGetUniformLocation(bitmapChromaDenoiseProgram, "uOutputStrength"),
+            ChromaDenoiseDefaults.outputStrength(strength)
+        )
+        GLES30.glUniform1f(
+            GLES30.glGetUniformLocation(
+                bitmapChromaDenoiseProgram,
+                "uEdgeGuidanceRelaxation"
+            ),
+            edgeGuidanceRelaxation
+        )
+        GLES30.glUniform1i(
+            GLES30.glGetUniformLocation(bitmapChromaDenoiseProgram, "uCameraRgbInput"),
+            0
+        )
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(bitmapChromaDenoiseProgram, "uH"), h)
+        GLES30.glUniform4f(
+            GLES30.glGetUniformLocation(bitmapChromaDenoiseProgram, "uNoiseModelRB"),
+            BITMAP_DENOISE_A * 2f,
+            BITMAP_DENOISE_B * 2f,
+            BITMAP_DENOISE_A * 2f,
+            BITMAP_DENOISE_B * 2f
+        )
+        GLES30.glUniform2f(
+            GLES30.glGetUniformLocation(bitmapChromaDenoiseProgram, "uNoiseModelG"),
+            BITMAP_DENOISE_A * 2f,
+            BITMAP_DENOISE_B * 2f
+        )
+        drawQuad(bitmapChromaDenoiseProgram)
+        checkGlError("renderBitmapChromaDenoise")
+    }
+
+    private fun renderBitmapChromaDenoiseEdgeGuide(
+        sourceTextureId: Int,
+        targetFramebufferId: Int,
+        width: Int,
+        height: Int,
+    ) {
+        GLES30.glUseProgram(bitmapChromaDenoiseGuideProgram)
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, targetFramebufferId)
+        GLES30.glViewport(0, 0, width, height)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, sourceTextureId)
+        GLES30.glUniform1i(
+            GLES30.glGetUniformLocation(bitmapChromaDenoiseGuideProgram, "uInputTexture"),
+            0
+        )
+        GLES30.glUniform2f(
+            GLES30.glGetUniformLocation(bitmapChromaDenoiseGuideProgram, "uTexelSize"),
+            1.0f / width,
+            1.0f / height
+        )
+        GLES30.glUniform1i(
+            GLES30.glGetUniformLocation(bitmapChromaDenoiseGuideProgram, "uCameraRgbInput"),
+            0
+        )
+        val identityMatrix = FloatArray(16)
+        android.opengl.Matrix.setIdentityM(identityMatrix, 0)
+        GLES30.glUniformMatrix4fv(
+            GLES30.glGetUniformLocation(bitmapChromaDenoiseGuideProgram, "uMVPMatrix"),
+            1,
+            false,
+            identityMatrix,
+            0
+        )
+        drawQuad(bitmapChromaDenoiseGuideProgram)
+        checkGlError("renderBitmapChromaDenoiseEdgeGuide")
+    }
+
+    private fun resolvePreToneMapChromaDenoise(
+        userStrength: Float,
+        applyNaturalLightDefault: Boolean
+    ): Float {
+        return if (applyNaturalLightDefault) {
+            ChromaDenoiseDefaults.forRawCapture(userStrength)
+        } else {
+            DenoiseStrength.clamp(userStrength)
+        }
+    }
+
+    private fun renderTexturePassthrough(sourceTextureId: Int, targetFboId: Int, width: Int, height: Int) {
+        GLES30.glUseProgram(bitmapDenoisePassthroughProgram)
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, targetFboId)
+        GLES30.glViewport(0, 0, width, height)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, sourceTextureId)
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(bitmapDenoisePassthroughProgram, "uInputTexture"), 0)
+        val identityMatrix = FloatArray(16)
+        android.opengl.Matrix.setIdentityM(identityMatrix, 0)
+        GLES30.glUniformMatrix4fv(
+            GLES30.glGetUniformLocation(bitmapDenoisePassthroughProgram, "uMVPMatrix"),
+            1,
+            false,
+            identityMatrix,
+            0
+        )
+        drawQuad(bitmapDenoisePassthroughProgram)
+    }
+
+    private fun renderSrgbInputToLinear(sourceTextureId: Int, width: Int, height: Int): Int {
+        setupBitmapDenoiseFramebuffers(width, height)
+        if (naturalLightSrgbToLinearProgram == 0) return sourceTextureId
+        val targetIndex = if (sourceTextureId == bitmapDenoiseTexId[0]) 1 else 0
+        val targetFboId = bitmapDenoiseFboId[targetIndex]
+        val targetTextureId = bitmapDenoiseTexId[targetIndex]
+        val identityMatrix = FloatArray(16)
+        android.opengl.Matrix.setIdentityM(identityMatrix, 0)
+
+        GLES30.glUseProgram(naturalLightSrgbToLinearProgram)
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, targetFboId)
+        GLES30.glViewport(0, 0, width, height)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, sourceTextureId)
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(naturalLightSrgbToLinearProgram, "uInputTexture"), 0)
+        GLES30.glUniformMatrix4fv(
+            GLES30.glGetUniformLocation(naturalLightSrgbToLinearProgram, "uMVPMatrix"),
+            1,
+            false,
+            identityMatrix,
+            0
+        )
+        drawQuad(naturalLightSrgbToLinearProgram)
+        checkGlError("renderSrgbInputToLinear")
+        return targetTextureId
+    }
+
+    private fun setupLutSharpenFramebuffer(width: Int, height: Int): Boolean {
+        if (lutSharpenFboId != 0 &&
+            lutSharpenTextureId != 0 &&
+            lutSharpenWidth == width &&
+            lutSharpenHeight == height
+        ) {
+            return true
+        }
+
+        releaseLutSharpenFramebuffer()
+
+        val textures = IntArray(1)
+        GLES30.glGenTextures(1, textures, 0)
+        lutSharpenTextureId = textures[0]
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, lutSharpenTextureId)
+        GLES30.glTexImage2D(
+            GLES30.GL_TEXTURE_2D,
+            0,
+            GLES30.GL_RGBA,
+            width,
+            height,
+            0,
+            GLES30.GL_RGBA,
+            GLES30.GL_UNSIGNED_BYTE,
+            null
+        )
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+
+        val framebuffers = IntArray(1)
+        GLES30.glGenFramebuffers(1, framebuffers, 0)
+        lutSharpenFboId = framebuffers[0]
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, lutSharpenFboId)
+        GLES30.glFramebufferTexture2D(
+            GLES30.GL_FRAMEBUFFER,
+            GLES30.GL_COLOR_ATTACHMENT0,
+            GLES30.GL_TEXTURE_2D,
+            lutSharpenTextureId,
+            0
+        )
+
+        val status = GLES30.glCheckFramebufferStatus(GLES30.GL_FRAMEBUFFER)
+        if (status != GLES30.GL_FRAMEBUFFER_COMPLETE) {
+            PLog.e(TAG, "LUT sharpen FBO incomplete: $status")
+            releaseLutSharpenFramebuffer()
+            return false
+        }
+
+        lutSharpenWidth = width
+        lutSharpenHeight = height
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+        return true
+    }
+
+    private fun renderLutSharpenPass(
+        sourceTextureId: Int,
+        width: Int,
+        height: Int,
+        sharpening: Float
+    ): Boolean {
+        if (lutSharpenProgram == 0 || sharpening <= 0f || !setupLutSharpenFramebuffer(width, height)) {
+            return false
+        }
+
+        val identityMatrix = FloatArray(16)
+        android.opengl.Matrix.setIdentityM(identityMatrix, 0)
+
+        GLES30.glDisable(GLES30.GL_BLEND)
+        GLES30.glUseProgram(lutSharpenProgram)
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, lutSharpenFboId)
+        GLES30.glViewport(0, 0, width, height)
+        GLES30.glClear(GLES30.GL_COLOR_BUFFER_BIT)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, sourceTextureId)
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(lutSharpenProgram, "uInputTexture"), 0)
+        GLES30.glUniform2f(
+            GLES30.glGetUniformLocation(lutSharpenProgram, "uTexelSize"),
+            1.0f / width,
+            1.0f / height
+        )
+        GLES30.glUniform1f(
+            GLES30.glGetUniformLocation(lutSharpenProgram, "uSharpening"),
+            sharpening
+        )
+        GLES30.glUniform1f(
+            GLES30.glGetUniformLocation(lutSharpenProgram, "uRadius"),
+            RawSharpenPass.DEFAULT_RADIUS
+        )
+        GLES30.glUniform1f(
+            GLES30.glGetUniformLocation(lutSharpenProgram, "uThreshold"),
+            RawSharpenPass.DEFAULT_THRESHOLD
+        )
+        GLES30.glUniformMatrix4fv(
+            GLES30.glGetUniformLocation(lutSharpenProgram, "uMVPMatrix"),
+            1,
+            false,
+            identityMatrix,
+            0
+        )
+        drawQuad(lutSharpenProgram)
+
+        val error = GLES30.glGetError()
+        if (error != GLES30.GL_NO_ERROR) {
+            PLog.e(TAG, "renderLutSharpenPass: glError $error")
+            return false
+        }
+        return true
+    }
+
+    private fun releaseLutSharpenFramebuffer() {
+        if (lutSharpenFboId != 0) {
+            GLES30.glDeleteFramebuffers(1, intArrayOf(lutSharpenFboId), 0)
+            lutSharpenFboId = 0
+        }
+        if (lutSharpenTextureId != 0) {
+            GLES30.glDeleteTextures(1, intArrayOf(lutSharpenTextureId), 0)
+            lutSharpenTextureId = 0
+        }
+        lutSharpenWidth = 0
+        lutSharpenHeight = 0
+    }
+
+    private data class BitmapDenoiseParams(
+        val strength: Float,
+        val patchRadius: Int,
+        val expectedFineDistance: Float,
+        val expectedGuideDistance: Float,
+        val inverseBandwidth: Float,
+        val coarseGuideWeight: Float,
+        val centralPixelWeight: Float,
+        val p: FloatArray,
+        val signalScale: FloatArray,
+        val aa: FloatArray,
+        val bb: FloatArray,
+        val bias: Float,
+        val scale: Float
+    )
+
+    private fun isBitmapDenoiseProfileReady(): Boolean {
+        return bitmapDenoisePreconditionProgram != 0 &&
+            bitmapDenoiseNlmInitProgram != 0 &&
+            bitmapDenoiseNlmFusedAccuProgram != 0 &&
+            bitmapDenoiseNlmFinishProgram != 0 &&
+            bitmapDenoisePassthroughProgram != 0
+    }
+
+    private fun setupBitmapDenoiseResources(width: Int, height: Int) {
+        val pixelCount = width * height
+        if (
+            bitmapDenoiseNlmBufferPixels == pixelCount &&
+            bitmapDenoiseNlmU2BufferId != 0
+        ) {
+            return
+        }
+
+        if (bitmapDenoiseNlmU2BufferId != 0) {
+            GLES31.glDeleteBuffers(1, intArrayOf(bitmapDenoiseNlmU2BufferId), 0)
+            bitmapDenoiseNlmU2BufferId = 0
+        }
+
+        val buffers = IntArray(1)
+        GLES31.glGenBuffers(buffers.size, buffers, 0)
+        bitmapDenoiseNlmU2BufferId = buffers[0]
+
+        GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, bitmapDenoiseNlmU2BufferId)
+        GLES31.glBufferData(GLES31.GL_SHADER_STORAGE_BUFFER, pixelCount * 4 * 4, null, GLES31.GL_DYNAMIC_DRAW)
+        GLES31.glBindBuffer(GLES31.GL_SHADER_STORAGE_BUFFER, 0)
+        bitmapDenoiseNlmBufferPixels = pixelCount
+    }
+
+    private fun buildBitmapDenoiseParams(strengthValue: Float): BitmapDenoiseParams {
+        val strength = DenoiseStrength.clamp(strengthValue)
+        val varianceScale = DenoiseStrength.noiseVarianceScale(strength)
+        val a = BITMAP_DENOISE_A * varianceScale
+        val b = BITMAP_DENOISE_B * varianceScale
+        val scale = 1.0f
+        val shadows = max(0.1f - 0.1f * ln(a), 0.7f).coerceAtMost(1.8f)
+        val bias = -max(5f + 0.5f * ln(a), 0.0f)
+        val compensateP = 0.05f / 0.05f.pow(shadows)
+        val patchRadius = DenoiseProfileShaders.PATCH_RADIUS
+        val weightTuning = DenoiseProfileNlmConfig.weightTuning(patchRadius)
+        val centralPixelWeight = 0.1f * scale
+        return BitmapDenoiseParams(
+            strength = DenoiseStrength.outputMix(strength),
+            patchRadius = patchRadius,
+            expectedFineDistance = weightTuning.expectedFineDistance,
+            expectedGuideDistance = weightTuning.expectedGuideDistance,
+            inverseBandwidth = weightTuning.inverseBandwidth,
+            coarseGuideWeight = weightTuning.coarseGuideWeight,
+            centralPixelWeight = centralPixelWeight,
+            p = floatArrayOf(shadows, shadows, shadows, 1.0f),
+            signalScale = floatArrayOf(
+                scale,
+                scale,
+                scale,
+                1.0f
+            ),
+            aa = floatArrayOf(a * compensateP, a * compensateP, a * compensateP, 1.0f),
+            bb = floatArrayOf(b, b, b, 1.0f),
+            bias = bias,
+            scale = scale
+        )
+    }
+
+    private fun dispatchBitmapDenoisePreconditionV2(input: Int, output: Int, width: Int, height: Int, params: BitmapDenoiseParams) {
+        GLES31.glUseProgram(bitmapDenoisePreconditionProgram)
+        bindComputeSampler(bitmapDenoisePreconditionProgram, "uInput", 0, input)
+        GLES31.glBindImageTexture(1, output, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES31.GL_RGBA16F)
+        setBitmapDenoiseCommonUniforms(bitmapDenoisePreconditionProgram, width, height, params)
+        dispatchBitmapDenoiseImage(width, height, "BitmapDenoise NLM precondition")
+    }
+
+    private fun dispatchBitmapDenoiseNlm(
+        originalTextureId: Int,
+        preconditionedTextureId: Int,
+        outputTextureId: Int,
+        width: Int,
+        height: Int,
+        params: BitmapDenoiseParams
+    ) {
+        dispatchBitmapDenoiseNlmInit(width, height)
+
+        for (offset in DenoiseProfileNlmConfig.searchOffsets) {
+            dispatchBitmapDenoiseNlmFusedAccumulate(
+                preconditionedTextureId,
+                width,
+                height,
+                offset.x,
+                offset.y,
+                params
+            )
+        }
+
+        dispatchBitmapDenoiseNlmFinish(originalTextureId, outputTextureId, width, height, params)
+    }
+
+    private fun dispatchBitmapDenoiseNlmInit(width: Int, height: Int) {
+        GLES31.glUseProgram(bitmapDenoiseNlmInitProgram)
+        GLES31.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER, 0, bitmapDenoiseNlmU2BufferId)
+        GLES31.glUniform2i(GLES31.glGetUniformLocation(bitmapDenoiseNlmInitProgram, "uImageSize"), width, height)
+        setBitmapDenoiseStripeUniforms(bitmapDenoiseNlmInitProgram, height)
+        dispatchBitmapDenoiseImage(width, height, "BitmapDenoise NLM init")
+        GLES31.glMemoryBarrier(GLES31.GL_SHADER_STORAGE_BARRIER_BIT)
+    }
+
+    private fun dispatchBitmapDenoiseNlmFusedAccumulate(
+        input: Int,
+        width: Int,
+        height: Int,
+        qx: Int,
+        qy: Int,
+        params: BitmapDenoiseParams
+    ) {
+        GLES31.glUseProgram(bitmapDenoiseNlmFusedAccuProgram)
+        bindComputeSampler(bitmapDenoiseNlmFusedAccuProgram, "uInput", 0, input)
+        GLES31.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER, 0, bitmapDenoiseNlmU2BufferId)
+        GLES31.glUniform2i(GLES31.glGetUniformLocation(bitmapDenoiseNlmFusedAccuProgram, "uImageSize"), width, height)
+        setBitmapDenoiseStripeUniforms(bitmapDenoiseNlmFusedAccuProgram, height)
+        GLES31.glUniform2i(GLES31.glGetUniformLocation(bitmapDenoiseNlmFusedAccuProgram, "uQ"), qx, qy)
+        GLES31.glUniform1f(
+            GLES31.glGetUniformLocation(bitmapDenoiseNlmFusedAccuProgram, "uExpectedFineDistance"),
+            params.expectedFineDistance
+        )
+        GLES31.glUniform1f(
+            GLES31.glGetUniformLocation(bitmapDenoiseNlmFusedAccuProgram, "uExpectedGuideDistance"),
+            params.expectedGuideDistance
+        )
+        GLES31.glUniform1f(
+            GLES31.glGetUniformLocation(bitmapDenoiseNlmFusedAccuProgram, "uInverseBandwidth"),
+            params.inverseBandwidth
+        )
+        GLES31.glUniform1f(
+            GLES31.glGetUniformLocation(bitmapDenoiseNlmFusedAccuProgram, "uCoarseGuideWeight"),
+            params.coarseGuideWeight
+        )
+        GLES31.glUniform1f(
+            GLES31.glGetUniformLocation(bitmapDenoiseNlmFusedAccuProgram, "uCentralPixelWeight"),
+            params.centralPixelWeight
+        )
+        dispatchBitmapDenoiseImage(width, height, "BitmapDenoise NLM fused accu q=($qx,$qy)")
+        GLES31.glMemoryBarrier(GLES31.GL_SHADER_STORAGE_BARRIER_BIT)
+    }
+
+    private fun dispatchBitmapDenoiseNlmFinish(input: Int, output: Int, width: Int, height: Int, params: BitmapDenoiseParams) {
+        GLES31.glUseProgram(bitmapDenoiseNlmFinishProgram)
+        bindComputeSampler(bitmapDenoiseNlmFinishProgram, "uInput", 0, input)
+        GLES31.glBindBufferBase(GLES31.GL_SHADER_STORAGE_BUFFER, 0, bitmapDenoiseNlmU2BufferId)
+        GLES31.glBindImageTexture(1, output, 0, false, 0, GLES31.GL_WRITE_ONLY, GLES31.GL_RGBA16F)
+        setBitmapDenoiseCommonUniforms(bitmapDenoiseNlmFinishProgram, width, height, params)
+        setBitmapDenoiseStripeUniforms(bitmapDenoiseNlmFinishProgram, height)
+        GLES31.glUniform1f(GLES31.glGetUniformLocation(bitmapDenoiseNlmFinishProgram, "uBias"), params.bias - 0.5f * ln(params.scale))
+        GLES31.glUniform1f(
+            GLES31.glGetUniformLocation(bitmapDenoiseNlmFinishProgram, "uDenoiseMix"),
+            params.strength
+        )
+        dispatchBitmapDenoiseImage(width, height, "BitmapDenoise NLM finish")
+    }
+
+    private fun setBitmapDenoiseStripeUniforms(program: Int, height: Int) {
+        GLES31.glUniform1i(GLES31.glGetUniformLocation(program, "uStripeRowOffset"), 0)
+        GLES31.glUniform1i(GLES31.glGetUniformLocation(program, "uStripeRowCount"), height)
+    }
+
+    private fun setBitmapDenoiseCommonUniforms(program: Int, width: Int, height: Int, params: BitmapDenoiseParams) {
+        GLES31.glUniform2i(GLES31.glGetUniformLocation(program, "uImageSize"), width, height)
+        GLES31.glUniform4fv(GLES31.glGetUniformLocation(program, "uA"), 1, params.aa, 0)
+        GLES31.glUniform4fv(GLES31.glGetUniformLocation(program, "uP"), 1, params.p, 0)
+        GLES31.glUniform4fv(GLES31.glGetUniformLocation(program, "uB"), 1, params.bb, 0)
+        GLES31.glUniform4fv(
+            GLES31.glGetUniformLocation(program, "uSignalScale"),
+            1,
+            params.signalScale,
+            0
+        )
+    }
+
+    private fun bindComputeSampler(program: Int, name: String, unit: Int, textureId: Int) {
+        GLES31.glActiveTexture(GLES31.GL_TEXTURE0 + unit)
+        GLES31.glBindTexture(GLES31.GL_TEXTURE_2D, textureId)
+        GLES31.glUniform1i(GLES31.glGetUniformLocation(program, name), unit)
+    }
+
+    private fun dispatchBitmapDenoiseImage(width: Int, height: Int, tag: String) {
+        GLES31.glDispatchCompute(
+            GlesComputeWorkGroup.imageGroupCount(width),
+            GlesComputeWorkGroup.imageGroupCount(height),
+            1,
+        )
+        GLES31.glMemoryBarrier(
+            GLES31.GL_SHADER_IMAGE_ACCESS_BARRIER_BIT or
+                GLES31.GL_TEXTURE_FETCH_BARRIER_BIT or
+                GLES31.GL_FRAMEBUFFER_BARRIER_BIT
+        )
+        checkGlError(tag)
+    }
+
+    
+    private fun setupHDFFramebuffers(width: Int, height: Int) {
+        val dsW = width / 4
+        val dsH = height / 4
+        if (hdfWidth == dsW && hdfHeight == dsH && hdfTexId[0] != 0) return
+        hdfWidth = dsW
+        hdfHeight = dsH
+
+        
+        for (i in 0..1) {
+            if (hdfTexId[i] != 0) GLES30.glDeleteTextures(1, intArrayOf(hdfTexId[i]), 0)
+            if (hdfFboId[i] != 0) GLES30.glDeleteFramebuffers(1, intArrayOf(hdfFboId[i]), 0)
+        }
+
+        
+        for (i in 0..1) {
+            val t = IntArray(1)
+            val f = IntArray(1)
+            GLES30.glGenTextures(1, t, 0)
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, t[0])
+            GLES30.glTexImage2D(
+                GLES30.GL_TEXTURE_2D, 0, GLES30.GL_RGBA16F,
+                dsW, dsH, 0,
+                GLES30.GL_RGBA, GLES30.GL_HALF_FLOAT, null
+            )
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+            GLES30.glGenFramebuffers(1, f, 0)
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, f[0])
+            GLES30.glFramebufferTexture2D(
+                GLES30.GL_FRAMEBUFFER, GLES30.GL_COLOR_ATTACHMENT0,
+                GLES30.GL_TEXTURE_2D, t[0], 0
+            )
+            hdfTexId[i] = t[0]
+            hdfFboId[i] = f[0]
+        }
+
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+    }
+
+    private fun setupSoftLightFramebuffers(width: Int, height: Int) {
+        val dsW = max(1, width / 4)
+        val dsH = max(1, height / 4)
+        if (softLightWidth == dsW && softLightHeight == dsH && softLightTexId[0] != 0) return
+        softLightWidth = dsW
+        softLightHeight = dsH
+
+        for (i in 0..1) {
+            if (softLightTexId[i] != 0) GLES30.glDeleteTextures(1, intArrayOf(softLightTexId[i]), 0)
+            if (softLightFboId[i] != 0) GLES30.glDeleteFramebuffers(1, intArrayOf(softLightFboId[i]), 0)
+        }
+
+        for (i in 0..1) {
+            val t = IntArray(1)
+            val f = IntArray(1)
+            GLES30.glGenTextures(1, t, 0)
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, t[0])
+            GLES30.glTexImage2D(
+                GLES30.GL_TEXTURE_2D, 0, GLES30.GL_RGBA16F,
+                dsW, dsH, 0,
+                GLES30.GL_RGBA, GLES30.GL_HALF_FLOAT, null
+            )
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+            GLES30.glGenFramebuffers(1, f, 0)
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, f[0])
+            GLES30.glFramebufferTexture2D(
+                GLES30.GL_FRAMEBUFFER, GLES30.GL_COLOR_ATTACHMENT0,
+                GLES30.GL_TEXTURE_2D, t[0], 0
+            )
+            softLightTexId[i] = t[0]
+            softLightFboId[i] = f[0]
+        }
+
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, 0)
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+    }
+
+    private fun setupClarityFramebuffers(width: Int, height: Int): Boolean {
+        if (
+            clarityOutputWidth == width &&
+            clarityOutputHeight == height &&
+            clarityOutputTextureId != 0 &&
+            clarityPyramidTexId.all { it != 0 }
+        ) {
+            return true
+        }
+
+        val maxTextureSize = IntArray(1)
+        GLES30.glGetIntegerv(GLES30.GL_MAX_TEXTURE_SIZE, maxTextureSize, 0)
+        if (width <= 0 || height <= 0 || width > maxTextureSize[0] || height > maxTextureSize[0]) {
+            PLog.e(
+                TAG,
+                "Clarity target ${width}x$height exceeds GL_MAX_TEXTURE_SIZE=${maxTextureSize[0]}",
+            )
+            return false
+        }
+
+        releaseClarityFramebuffers()
+        var levelWidth = width
+        var levelHeight = height
+        for (level in 0 until CLARITY_PYRAMID_LEVELS) {
+            levelWidth = max(1, (levelWidth + 1) / 2)
+            levelHeight = max(1, (levelHeight + 1) / 2)
+            val target = createClarityFramebuffer(
+                width = levelWidth,
+                height = levelHeight,
+                internalFormat = GLES30.GL_RGBA16F,
+                label = "pyramid[$level]",
+            ) ?: run {
+                releaseClarityFramebuffers()
+                return false
+            }
+            clarityPyramidTexId[level] = target.first
+            clarityPyramidFboId[level] = target.second
+            clarityPyramidWidths[level] = levelWidth
+            clarityPyramidHeights[level] = levelHeight
+        }
+
+        val output = createClarityFramebuffer(
+            width = width,
+            height = height,
+            internalFormat = GLES30.GL_RGBA8,
+            label = "output",
+        ) ?: run {
+            releaseClarityFramebuffers()
+            return false
+        }
+        clarityOutputTextureId = output.first
+        clarityOutputFboId = output.second
+        clarityOutputWidth = width
+        clarityOutputHeight = height
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, 0)
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+        return true
+    }
+
+    private fun createClarityFramebuffer(
+        width: Int,
+        height: Int,
+        internalFormat: Int,
+        label: String,
+    ): Pair<Int, Int>? {
+        val texture = IntArray(1)
+        val framebuffer = IntArray(1)
+        GLES30.glGenTextures(1, texture, 0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, texture[0])
+        GLES30.glTexStorage2D(GLES30.GL_TEXTURE_2D, 1, internalFormat, width, height)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+
+        GLES30.glGenFramebuffers(1, framebuffer, 0)
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, framebuffer[0])
+        GLES30.glFramebufferTexture2D(
+            GLES30.GL_FRAMEBUFFER,
+            GLES30.GL_COLOR_ATTACHMENT0,
+            GLES30.GL_TEXTURE_2D,
+            texture[0],
+            0,
+        )
+        val status = GLES30.glCheckFramebufferStatus(GLES30.GL_FRAMEBUFFER)
+        val error = GLES30.glGetError()
+        if (status != GLES30.GL_FRAMEBUFFER_COMPLETE || error != GLES30.GL_NO_ERROR) {
+            PLog.e(
+                TAG,
+                "Clarity $label framebuffer allocation failed: status=$status glError=$error",
+            )
+            GLES30.glDeleteFramebuffers(1, framebuffer, 0)
+            GLES30.glDeleteTextures(1, texture, 0)
+            return null
+        }
+        return texture[0] to framebuffer[0]
+    }
+
+    private fun releaseClarityFramebuffers() {
+        for (level in 0 until CLARITY_PYRAMID_LEVELS) {
+            if (clarityPyramidTexId[level] != 0) {
+                GLES30.glDeleteTextures(1, intArrayOf(clarityPyramidTexId[level]), 0)
+                clarityPyramidTexId[level] = 0
+            }
+            if (clarityPyramidFboId[level] != 0) {
+                GLES30.glDeleteFramebuffers(1, intArrayOf(clarityPyramidFboId[level]), 0)
+                clarityPyramidFboId[level] = 0
+            }
+            clarityPyramidWidths[level] = 0
+            clarityPyramidHeights[level] = 0
+        }
+        if (clarityOutputTextureId != 0) {
+            GLES30.glDeleteTextures(1, intArrayOf(clarityOutputTextureId), 0)
+            clarityOutputTextureId = 0
+        }
+        if (clarityOutputFboId != 0) {
+            GLES30.glDeleteFramebuffers(1, intArrayOf(clarityOutputFboId), 0)
+            clarityOutputFboId = 0
+        }
+        clarityOutputWidth = 0
+        clarityOutputHeight = 0
+    }
+
+    private fun renderClarity(
+        sourceTextureId: Int,
+        width: Int,
+        height: Int,
+        clarity: Float,
+    ): Boolean {
+        if (clarityDownsampleProgram == 0 || clarityCompositeProgram == 0) {
+            return false
+        }
+        val upstreamError = GLES30.glGetError()
+        if (upstreamError != GLES30.GL_NO_ERROR) {
+            PLog.e(TAG, "renderClarity skipped after upstream glError $upstreamError")
+            return false
+        }
+        if (!setupClarityFramebuffers(width, height)) return false
+
+        val identityMatrix = FloatArray(16)
+        android.opengl.Matrix.setIdentityM(identityMatrix, 0)
+        GLES30.glDisable(GLES30.GL_BLEND)
+
+        var inputTextureId = sourceTextureId
+        var inputWidth = width
+        var inputHeight = height
+        for (level in 0 until CLARITY_PYRAMID_LEVELS) {
+            GLES30.glUseProgram(clarityDownsampleProgram)
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, clarityPyramidFboId[level])
+            GLES30.glViewport(0, 0, clarityPyramidWidths[level], clarityPyramidHeights[level])
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, inputTextureId)
+            GLES30.glUniform1i(
+                GLES30.glGetUniformLocation(clarityDownsampleProgram, "uInputTexture"),
+                0,
+            )
+            GLES30.glUniform2f(
+                GLES30.glGetUniformLocation(clarityDownsampleProgram, "uInputTexelSize"),
+                1f / inputWidth,
+                1f / inputHeight,
+            )
+            GLES30.glUniform1i(
+                GLES30.glGetUniformLocation(clarityDownsampleProgram, "uInputIsLuma"),
+                if (level == 0) 0 else 1,
+            )
+            GLES30.glUniformMatrix4fv(
+                GLES30.glGetUniformLocation(clarityDownsampleProgram, "uMVPMatrix"),
+                1,
+                false,
+                identityMatrix,
+                0,
+            )
+            drawQuad(clarityDownsampleProgram)
+            val error = GLES30.glGetError()
+            if (error != GLES30.GL_NO_ERROR) {
+                GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+                PLog.e(TAG, "renderClarity pyramid[$level] glError $error")
+                return false
+            }
+            inputTextureId = clarityPyramidTexId[level]
+            inputWidth = clarityPyramidWidths[level]
+            inputHeight = clarityPyramidHeights[level]
+        }
+
+        GLES30.glUseProgram(clarityCompositeProgram)
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, clarityOutputFboId)
+        GLES30.glViewport(0, 0, width, height)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, sourceTextureId)
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(clarityCompositeProgram, "uInputTexture"), 0)
+        val lumaUniforms = arrayOf(
+            "uFineLumaTexture",
+            "uMediumLumaTexture",
+            "uCoarseLumaTexture",
+        )
+        for (level in 0 until CLARITY_PYRAMID_LEVELS) {
+            val textureUnit = level + 1
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE0 + textureUnit)
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, clarityPyramidTexId[level])
+            GLES30.glUniform1i(
+                GLES30.glGetUniformLocation(clarityCompositeProgram, lumaUniforms[level]),
+                textureUnit,
+            )
+        }
+        GLES30.glUniform1f(
+            GLES30.glGetUniformLocation(clarityCompositeProgram, "uClarity"),
+            clarity.coerceIn(-1f, 1f),
+        )
+        GLES30.glUniformMatrix4fv(
+            GLES30.glGetUniformLocation(clarityCompositeProgram, "uMVPMatrix"),
+            1,
+            false,
+            identityMatrix,
+            0,
+        )
+        drawQuad(clarityCompositeProgram)
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+        val error = GLES30.glGetError()
+        if (error != GLES30.GL_NO_ERROR) {
+            PLog.e(TAG, "renderClarity glError $error")
+            return false
+        }
+        return true
+    }
+
+    private fun setupHalationFramebuffers(width: Int, height: Int) {
+        val dsW = width / 4
+        val dsH = height / 4
+        if (halationWidth == dsW && halationHeight == dsH && halationTexId[0] != 0) return
+        halationWidth = dsW
+        halationHeight = dsH
+
+        for (i in 0..1) {
+            if (halationTexId[i] != 0) GLES30.glDeleteTextures(1, intArrayOf(halationTexId[i]), 0)
+            if (halationFboId[i] != 0) GLES30.glDeleteFramebuffers(1, intArrayOf(halationFboId[i]), 0)
+            val t = IntArray(1)
+            val f = IntArray(1)
+            GLES30.glGenTextures(1, t, 0)
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, t[0])
+            GLES30.glTexImage2D(
+                GLES30.GL_TEXTURE_2D, 0, GLES30.GL_RGBA16F,
+                dsW, dsH, 0,
+                GLES30.GL_RGBA, GLES30.GL_HALF_FLOAT, null
+            )
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+            GLES30.glGenFramebuffers(1, f, 0)
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, f[0])
+            GLES30.glFramebufferTexture2D(
+                GLES30.GL_FRAMEBUFFER, GLES30.GL_COLOR_ATTACHMENT0,
+                GLES30.GL_TEXTURE_2D, t[0], 0
+            )
+            halationTexId[i] = t[0]
+            halationFboId[i] = f[0]
+        }
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+    }
+
+    private fun renderSoftLightBlur(
+        sourceTexId: Int,
+        width: Int,
+        height: Int
+    ) {
+        setupSoftLightFramebuffers(width, height)
+        if (softLightBlurHProgram == 0 || hdfBlurVProgram == 0) return
+
+        val dsW = softLightWidth
+        val dsH = softLightHeight
+        val texelW = 1.0f / dsW
+        val texelH = 1.0f / dsH
+
+        val identityMatrix = FloatArray(16)
+        android.opengl.Matrix.setIdentityM(identityMatrix, 0)
+
+        GLES30.glUseProgram(softLightBlurHProgram)
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, softLightFboId[0])
+        GLES30.glViewport(0, 0, dsW, dsH)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, sourceTexId)
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(softLightBlurHProgram, "uInputTexture"), 0)
+        GLES30.glUniform2f(GLES30.glGetUniformLocation(softLightBlurHProgram, "uTexelSize"), texelW, texelH)
+        GLES30.glUniformMatrix4fv(
+            GLES30.glGetUniformLocation(softLightBlurHProgram, "uMVPMatrix"), 1, false, identityMatrix, 0
+        )
+        drawQuad(softLightBlurHProgram)
+
+        GLES30.glUseProgram(hdfBlurVProgram)
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, softLightFboId[1])
+        GLES30.glViewport(0, 0, dsW, dsH)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, softLightTexId[0])
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(hdfBlurVProgram, "uInputTexture"), 0)
+        GLES30.glUniform2f(GLES30.glGetUniformLocation(hdfBlurVProgram, "uTexelSize"), texelW, texelH)
+        GLES30.glUniformMatrix4fv(
+            GLES30.glGetUniformLocation(hdfBlurVProgram, "uMVPMatrix"), 1, false, identityMatrix, 0
+        )
+        drawQuad(hdfBlurVProgram)
+
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+        checkGlError("renderSoftLightBlur")
+    }
+
+    private fun renderHalationBlur(
+        sourceTexId: Int,
+        width: Int,
+        height: Int,
+        halation: Float
+    ) {
+        setupHalationFramebuffers(width, height)
+        if (halationExtractBlurHProgram == 0 || halationBlurVProgram == 0) return
+
+        val dsW = width / 4
+        val dsH = height / 4
+        val texelW = 1.0f / dsW
+        val texelH = 1.0f / dsH
+        
+        val threshold = 0.72f - halation.coerceIn(0f, 1f) * 0.22f
+
+        val identityMatrix = FloatArray(16)
+        android.opengl.Matrix.setIdentityM(identityMatrix, 0)
+
+        
+        GLES30.glUseProgram(halationExtractBlurHProgram)
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, halationFboId[0])
+        GLES30.glViewport(0, 0, dsW, dsH)
+        
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, sourceTexId)
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(halationExtractBlurHProgram, "uInputTexture"), 0)
+        GLES30.glUniform2f(GLES30.glGetUniformLocation(halationExtractBlurHProgram, "uTexelSize"), texelW, texelH)
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(halationExtractBlurHProgram, "uThreshold"), threshold)
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(halationExtractBlurHProgram, "uStrength"), halation)
+        
+        GLES30.glUniformMatrix4fv(
+            GLES30.glGetUniformLocation(halationExtractBlurHProgram, "uMVPMatrix"), 1, false, identityMatrix, 0
+        )
+        drawQuad(halationExtractBlurHProgram)
+
+        
+        GLES30.glUseProgram(halationBlurVProgram)
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, halationFboId[1])
+        GLES30.glViewport(0, 0, dsW, dsH)
+        
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, halationTexId[0])
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(halationBlurVProgram, "uInputTexture"), 0)
+        GLES30.glUniform2f(GLES30.glGetUniformLocation(halationBlurVProgram, "uTexelSize"), texelW, texelH)
+        
+        GLES30.glUniformMatrix4fv(
+            GLES30.glGetUniformLocation(halationBlurVProgram, "uMVPMatrix"), 1, false, identityMatrix, 0
+        )
+        drawQuad(halationBlurVProgram)
+
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+    }
+
+    
+    private fun renderHDFBlur(
+        sourceTextureId: Int,
+        width: Int,
+        height: Int,
+        halation: Float
+    ) {
+        setupHDFFramebuffers(width, height)
+        if (hdfExtractBlurHProgram == 0 || hdfBlurVProgram == 0) return
+
+        val dsW = width / 4
+        val dsH = height / 4
+        val texelW = 1.0f / dsW
+        val texelH = 1.0f / dsH
+
+        val identityMatrix = FloatArray(16)
+        android.opengl.Matrix.setIdentityM(identityMatrix, 0)
+
+        val threshold = 0.9f - halation * 0.3f
+
+        
+        GLES30.glUseProgram(hdfExtractBlurHProgram)
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, hdfFboId[0])
+        GLES30.glViewport(0, 0, dsW, dsH)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, sourceTextureId)
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(hdfExtractBlurHProgram, "uInputTexture"), 0)
+        GLES30.glUniform2f(GLES30.glGetUniformLocation(hdfExtractBlurHProgram, "uTexelSize"), texelW, texelH)
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(hdfExtractBlurHProgram, "uThreshold"), threshold)
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(hdfExtractBlurHProgram, "uStrength"), halation)
+        GLES30.glUniformMatrix4fv(
+            GLES30.glGetUniformLocation(hdfExtractBlurHProgram, "uMVPMatrix"), 1, false, identityMatrix, 0
+        )
+        drawQuad(hdfExtractBlurHProgram)
+
+        
+        GLES30.glUseProgram(hdfBlurVProgram)
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, hdfFboId[1])
+        GLES30.glViewport(0, 0, dsW, dsH)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, hdfTexId[0])
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(hdfBlurVProgram, "uInputTexture"), 0)
+        GLES30.glUniform2f(GLES30.glGetUniformLocation(hdfBlurVProgram, "uTexelSize"), texelW, texelH)
+        GLES30.glUniformMatrix4fv(
+            GLES30.glGetUniformLocation(hdfBlurVProgram, "uMVPMatrix"), 1, false, identityMatrix, 0
+        )
+        drawQuad(hdfBlurVProgram)
+
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+        checkGlError("renderHDFBlur")
+    }
+
+    private fun setupBloomOutputFramebuffer(width: Int, height: Int): Boolean {
+        if (bloomOutputFboId != 0 &&
+            bloomOutputTextureId != 0 &&
+            bloomOutputWidth == width &&
+            bloomOutputHeight == height
+        ) {
+            return true
+        }
+        if (bloomOutputFboId != 0) GLES30.glDeleteFramebuffers(1, intArrayOf(bloomOutputFboId), 0)
+        if (bloomOutputTextureId != 0) GLES30.glDeleteTextures(1, intArrayOf(bloomOutputTextureId), 0)
+        val f = IntArray(1)
+        val t = IntArray(1)
+        GLES30.glGenTextures(1, t, 0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, t[0])
+        GLES30.glTexImage2D(GLES30.GL_TEXTURE_2D, 0, GLES30.GL_RGBA, width, height, 0, GLES30.GL_RGBA, GLES30.GL_UNSIGNED_BYTE, null)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+        GLES30.glGenFramebuffers(1, f, 0)
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, f[0])
+        GLES30.glFramebufferTexture2D(GLES30.GL_FRAMEBUFFER, GLES30.GL_COLOR_ATTACHMENT0, GLES30.GL_TEXTURE_2D, t[0], 0)
+        val status = GLES30.glCheckFramebufferStatus(GLES30.GL_FRAMEBUFFER)
+        if (status != GLES30.GL_FRAMEBUFFER_COMPLETE) {
+            PLog.e(TAG, "Bloom output framebuffer not complete: $status")
+            if (f[0] != 0) GLES30.glDeleteFramebuffers(1, f, 0)
+            if (t[0] != 0) GLES30.glDeleteTextures(1, t, 0)
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+            return false
+        }
+        bloomOutputTextureId = t[0]
+        bloomOutputFboId = f[0]
+        bloomOutputWidth = width
+        bloomOutputHeight = height
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+        return true
+    }
+
+    private fun setupBloomFramebuffers(width: Int, height: Int): Boolean {
+        val maxMipDimension = BloomLdrSettings.MAX_MIP_DIMENSION
+        val scale = maxMipDimension.toFloat() / maxOf(1, height).toFloat()
+        var mipWidth = (width * scale).toInt().coerceAtLeast(1)
+        var mipHeight = (height * scale).toInt().coerceAtLeast(1)
+        val widths = mutableListOf<Int>()
+        val heights = mutableListOf<Int>()
+        repeat(BloomLdrSettings.MIP_COUNT) {
+            widths += mipWidth
+            heights += mipHeight
+            mipWidth = maxOf(1, mipWidth / 2)
+            mipHeight = maxOf(1, mipHeight / 2)
+        }
+        val nextWidths = widths.toIntArray()
+        val nextHeights = heights.toIntArray()
+        if (bloomSourceWidth == width &&
+            bloomSourceHeight == height &&
+            bloomTexId.isNotEmpty() &&
+            bloomMipWidths.contentEquals(nextWidths) &&
+            bloomMipHeights.contentEquals(nextHeights)
+        ) {
+            return true
+        }
+        releaseBloomFramebuffers()
+        bloomSourceWidth = width
+        bloomSourceHeight = height
+        bloomMipCount = nextWidths.size
+        bloomMipWidths = nextWidths
+        bloomMipHeights = nextHeights
+        bloomTexId = IntArray(bloomMipCount)
+        bloomFboId = IntArray(bloomMipCount)
+        for (i in 0 until bloomMipCount) {
+            val t = IntArray(1)
+            val f = IntArray(1)
+            GLES30.glGenTextures(1, t, 0)
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, t[0])
+            GLES30.glTexImage2D(
+                GLES30.GL_TEXTURE_2D,
+                0,
+                GLES30.GL_RGBA16F,
+                bloomMipWidths[i],
+                bloomMipHeights[i],
+                0,
+                GLES30.GL_RGBA,
+                GLES30.GL_HALF_FLOAT,
+                null
+            )
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MIN_FILTER, GLES30.GL_LINEAR)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_MAG_FILTER, GLES30.GL_LINEAR)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_S, GLES30.GL_CLAMP_TO_EDGE)
+            GLES30.glTexParameteri(GLES30.GL_TEXTURE_2D, GLES30.GL_TEXTURE_WRAP_T, GLES30.GL_CLAMP_TO_EDGE)
+            GLES30.glGenFramebuffers(1, f, 0)
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, f[0])
+            GLES30.glFramebufferTexture2D(GLES30.GL_FRAMEBUFFER, GLES30.GL_COLOR_ATTACHMENT0, GLES30.GL_TEXTURE_2D, t[0], 0)
+            bloomTexId[i] = t[0]
+            bloomFboId[i] = f[0]
+            val status = GLES30.glCheckFramebufferStatus(GLES30.GL_FRAMEBUFFER)
+            if (status != GLES30.GL_FRAMEBUFFER_COMPLETE) {
+                PLog.e(TAG, "Bloom mip framebuffer[$i] not complete: $status")
+                releaseBloomFramebuffers()
+                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, 0)
+                GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+                return false
+            }
+        }
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, 0)
+        return true
+    }
+
+    private fun releaseBloomFramebuffers() {
+        for (textureId in bloomTexId) {
+            if (textureId != 0) GLES30.glDeleteTextures(1, intArrayOf(textureId), 0)
+        }
+        for (fboId in bloomFboId) {
+            if (fboId != 0) GLES30.glDeleteFramebuffers(1, intArrayOf(fboId), 0)
+        }
+        bloomTexId = IntArray(0)
+        bloomFboId = IntArray(0)
+        bloomMipWidths = IntArray(0)
+        bloomMipHeights = IntArray(0)
+        bloomMipCount = 0
+        bloomSourceWidth = 0
+        bloomSourceHeight = 0
+    }
+
+    private fun renderLdrBloom(sourceTextureId: Int, width: Int, height: Int, bloomStrength: Float): Boolean {
+        if (!setupBloomFramebuffers(width, height)) {
+            return false
+        }
+        if (!setupBloomOutputFramebuffer(width, height)) {
+            return false
+        }
+        if (bloomMipCount <= 0 || bloomDownsampleFirstProgram == 0 || bloomDownsampleProgram == 0 || bloomUpsampleProgram == 0 || bloomCompositeProgram == 0) {
+            return false
+        }
+
+        GLES30.glDisable(GLES30.GL_BLEND)
+        GLES30.glUseProgram(bloomDownsampleFirstProgram)
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, bloomFboId[0])
+        GLES30.glViewport(0, 0, bloomMipWidths[0], bloomMipHeights[0])
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, sourceTextureId)
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(bloomDownsampleFirstProgram, "uInputTexture"), 0)
+        GLES30.glUniform2f(GLES30.glGetUniformLocation(bloomDownsampleFirstProgram, "uInputTexelSize"), 1f / width, 1f / height)
+        val thresholdPrecomputations = BloomLdrSettings.thresholdPrecomputations()
+        GLES30.glUniform4f(
+            GLES30.glGetUniformLocation(bloomDownsampleFirstProgram, "uThreshold"),
+            thresholdPrecomputations[0],
+            thresholdPrecomputations[1],
+            thresholdPrecomputations[2],
+            thresholdPrecomputations[3]
+        )
+        drawQuad(bloomDownsampleFirstProgram)
+
+        for (mip in 1 until bloomMipCount) {
+            GLES30.glUseProgram(bloomDownsampleProgram)
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, bloomFboId[mip])
+            GLES30.glViewport(0, 0, bloomMipWidths[mip], bloomMipHeights[mip])
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, bloomTexId[mip - 1])
+            GLES30.glUniform1i(GLES30.glGetUniformLocation(bloomDownsampleProgram, "uInputTexture"), 0)
+            GLES30.glUniform2f(GLES30.glGetUniformLocation(bloomDownsampleProgram, "uInputTexelSize"), 1f / bloomMipWidths[mip - 1], 1f / bloomMipHeights[mip - 1])
+            drawQuad(bloomDownsampleProgram)
+        }
+
+        GLES30.glEnable(GLES30.GL_BLEND)
+        GLES30.glBlendEquation(GLES30.GL_FUNC_ADD)
+        GLES30.glBlendFunc(GLES30.GL_CONSTANT_COLOR, GLES30.GL_ONE)
+        GLES30.glUseProgram(bloomUpsampleProgram)
+        for (mip in bloomMipCount - 1 downTo 1) {
+            val blend = BloomLdrSettings.mipAddWeight(mip, bloomMipCount, bloomStrength)
+            GLES30.glBlendColor(blend, blend, blend, blend)
+            GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, bloomFboId[mip - 1])
+            GLES30.glViewport(0, 0, bloomMipWidths[mip - 1], bloomMipHeights[mip - 1])
+            GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+            GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, bloomTexId[mip])
+            GLES30.glUniform1i(GLES30.glGetUniformLocation(bloomUpsampleProgram, "uInputTexture"), 0)
+            GLES30.glUniform2f(GLES30.glGetUniformLocation(bloomUpsampleProgram, "uInputTexelSize"), 1f / bloomMipWidths[mip], 1f / bloomMipHeights[mip])
+            drawQuad(bloomUpsampleProgram)
+        }
+        GLES30.glDisable(GLES30.GL_BLEND)
+
+        val finalBlend = BloomLdrSettings.compositeStrength(bloomStrength)
+        val compositeMipLower = BloomLdrSettings.compositeMipLowerIndex(bloomMipCount, bloomStrength)
+        val compositeMipUpper = BloomLdrSettings.compositeMipUpperIndex(bloomMipCount, bloomStrength)
+        val compositeMipBlend = BloomLdrSettings.compositeMipBlend(bloomMipCount, bloomStrength)
+        if (bitmapDenoisePassthroughProgram == 0) {
+            return false
+        }
+        renderTexturePassthrough(sourceTextureId, bloomOutputFboId, width, height)
+        GLES30.glEnable(GLES30.GL_BLEND)
+        GLES30.glBlendEquation(GLES30.GL_FUNC_ADD)
+        GLES30.glBlendFunc(GLES30.GL_ONE, GLES30.GL_ONE)
+        GLES30.glBindFramebuffer(GLES30.GL_FRAMEBUFFER, bloomOutputFboId)
+        GLES30.glViewport(0, 0, width, height)
+        GLES30.glUseProgram(bloomCompositeProgram)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, bloomTexId[compositeMipLower])
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(bloomCompositeProgram, "uBloomTexture"), 0)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE1)
+        GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, bloomTexId[compositeMipUpper])
+        GLES30.glUniform1i(GLES30.glGetUniformLocation(bloomCompositeProgram, "uBloomTextureNext"), 1)
+        GLES30.glUniform2f(
+            GLES30.glGetUniformLocation(bloomCompositeProgram, "uBloomTexelSize"),
+            1f / bloomMipWidths[compositeMipLower],
+            1f / bloomMipHeights[compositeMipLower]
+        )
+        GLES30.glUniform2f(
+            GLES30.glGetUniformLocation(bloomCompositeProgram, "uBloomTexelSizeNext"),
+            1f / bloomMipWidths[compositeMipUpper],
+            1f / bloomMipHeights[compositeMipUpper]
+        )
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(bloomCompositeProgram, "uBlend"), finalBlend)
+        GLES30.glUniform1f(GLES30.glGetUniformLocation(bloomCompositeProgram, "uMipBlend"), compositeMipBlend)
+        drawQuad(bloomCompositeProgram)
+        GLES30.glDisable(GLES30.GL_BLEND)
+        val error = GLES30.glGetError()
+        if (error != GLES30.GL_NO_ERROR) {
+            PLog.e(TAG, "renderLdrBloom final composite glError $error")
+            return false
+        }
+        return true
+    }
+
+    private fun checkGlError(op: String) {
+        val error = GLES30.glGetError()
+        if (error != GLES30.GL_NO_ERROR) {
+            PLog.e(TAG, "$op: glError $error")
+        }
+    }
+
+    private fun drawQuad(program: Int) {
+        val positionHandle = GLES30.glGetAttribLocation(program, "aPosition")
+        val texCoordHandle = GLES30.glGetAttribLocation(program, "aTexCoord")
+
+        if (positionHandle >= 0) {
+            vertexBuffer?.let {
+                GLES30.glEnableVertexAttribArray(positionHandle)
+                it.position(0)
+                GLES30.glVertexAttribPointer(positionHandle, 2, GLES30.GL_FLOAT, false, 0, it)
+            }
+        }
+        if (texCoordHandle >= 0) {
+            texCoordBuffer?.let {
+                GLES30.glEnableVertexAttribArray(texCoordHandle)
+                it.position(0)
+                GLES30.glVertexAttribPointer(texCoordHandle, 2, GLES30.GL_FLOAT, false, 0, it)
+            }
+        }
+
+        indexBuffer?.let {
+            it.position(0)
+            GLES30.glDrawElements(GLES30.GL_TRIANGLES, 6, GLES30.GL_UNSIGNED_SHORT, it)
+        }
+
+        if (positionHandle >= 0) GLES30.glDisableVertexAttribArray(positionHandle)
+        if (texCoordHandle >= 0) GLES30.glDisableVertexAttribArray(texCoordHandle)
+    }
+
+    private fun compileShader(type: Int, source: String): Int {
+        val shader = GLES30.glCreateShader(type)
+        GLES30.glShaderSource(shader, source)
+        GLES30.glCompileShader(shader)
+
+        val compiled = IntArray(1)
+        GLES30.glGetShaderiv(shader, GLES30.GL_COMPILE_STATUS, compiled, 0)
+        if (compiled[0] == 0) {
+            val error = GLES30.glGetShaderInfoLog(shader)
+            PLog.e(TAG, "Shader compilation failed: $error")
+            GLES30.glDeleteShader(shader)
+            return 0
+        }
+        return shader
+    }
+
+    private fun createFragmentProgram(vSource: String, fSource: String, name: String): Int {
+        val vShader = compileShader(GLES30.GL_VERTEX_SHADER, vSource)
+        val fShader = compileShader(GLES30.GL_FRAGMENT_SHADER, fSource)
+        if (vShader == 0 || fShader == 0) return 0
+        val program = GLES30.glCreateProgram()
+        GLES30.glAttachShader(program, vShader)
+        GLES30.glAttachShader(program, fShader)
+        GLES30.glLinkProgram(program)
+        val linked = IntArray(1)
+        GLES30.glGetProgramiv(program, GLES30.GL_LINK_STATUS, linked, 0)
+        if (linked[0] == 0) {
+            PLog.e(TAG, "Program $name linking failed: ${GLES30.glGetProgramInfoLog(program)}")
+            GLES30.glDeleteProgram(program)
+            GLES30.glDeleteShader(vShader)
+            GLES30.glDeleteShader(fShader)
+            return 0
+        }
+        GLES30.glDeleteShader(vShader)
+        GLES30.glDeleteShader(fShader)
+        return program
+    }
+
+    private fun compileComputeProgram(source: String, name: String): Int {
+        GlesComputeWorkGroup.requireBaselineCompatible(source, name)
+        val shader = GLES31.glCreateShader(GLES31.GL_COMPUTE_SHADER)
+        GLES31.glShaderSource(shader, source)
+        GLES31.glCompileShader(shader)
+        val compiled = IntArray(1)
+        GLES31.glGetShaderiv(shader, GLES31.GL_COMPILE_STATUS, compiled, 0)
+        if (compiled[0] == 0) {
+            PLog.e(TAG, "Compute shader $name compilation failed: ${GLES31.glGetShaderInfoLog(shader)}")
+            GLES31.glDeleteShader(shader)
+            return 0
+        }
+        val program = GLES31.glCreateProgram()
+        GLES31.glAttachShader(program, shader)
+        GLES31.glLinkProgram(program)
+        val linked = IntArray(1)
+        GLES31.glGetProgramiv(program, GLES31.GL_LINK_STATUS, linked, 0)
+        if (linked[0] == 0) {
+            PLog.e(TAG, "Compute program $name linking failed: ${GLES31.glGetProgramInfoLog(program)}")
+            GLES31.glDeleteProgram(program)
+            GLES31.glDeleteShader(shader)
+            return 0
+        }
+        GLES31.glDeleteShader(shader)
+        return program
+    }
+
+    private fun logAndValidateComputeCapabilities(): Boolean {
+        val vendor = GLES30.glGetString(GLES30.GL_VENDOR).orEmpty()
+        val renderer = GLES30.glGetString(GLES30.GL_RENDERER).orEmpty()
+        val version = GLES30.glGetString(GLES30.GL_VERSION).orEmpty()
+        val shadingLanguageVersion =
+            GLES30.glGetString(GLES30.GL_SHADING_LANGUAGE_VERSION).orEmpty()
+        PLog.i(
+            TAG,
+            "GL compute device: vendor=$vendor renderer=$renderer version=$version " +
+                "glsl=$shadingLanguageVersion",
+        )
+        if (!version.contains("OpenGL ES 3.1") && !version.contains("OpenGL ES 3.2")) {
+            PLog.e(TAG, "Bitmap denoise requires OpenGL ES 3.1+, got: $version")
+            return false
+        }
+
+        val value = IntArray(1)
+        GLES30.glGetIntegerv(GLES31.GL_MAX_COMPUTE_WORK_GROUP_INVOCATIONS, value, 0)
+        val maxInvocations = value[0]
+        GLES30.glGetIntegerv(GLES31.GL_MAX_COMPUTE_SHARED_MEMORY_SIZE, value, 0)
+        val maxSharedMemory = value[0]
+        val maxSize = IntArray(3)
+        for (axis in maxSize.indices) {
+            GLES30.glGetIntegeri_v(
+                GLES31.GL_MAX_COMPUTE_WORK_GROUP_SIZE,
+                axis,
+                value,
+                0,
+            )
+            maxSize[axis] = value[0]
+        }
+        PLog.i(
+            TAG,
+            "GL compute limits: workGroupInvocations=$maxInvocations " +
+                "workGroupSize=${maxSize.contentToString()} sharedMemory=$maxSharedMemory",
+        )
+        val supported =
+            maxInvocations >= GlesComputeWorkGroup.BASELINE_MAX_INVOCATIONS &&
+                maxSize[0] >= GlesComputeWorkGroup.LINEAR_SIZE &&
+                maxSize[1] >= GlesComputeWorkGroup.IMAGE_TILE_SIZE &&
+                maxSize[2] >= 1
+        if (!supported) {
+            PLog.e(
+                TAG,
+                "Bitmap denoise requires the OpenGL ES 3.1 compute baseline; " +
+                    "got invocations=$maxInvocations size=${maxSize.contentToString()}",
+            )
+        }
+        return supported
+    }
+
+    private fun initBuffers() {
+        
+        vertexBuffer = ByteBuffer.allocateDirect(Shaders.FULL_QUAD_VERTICES.size * 4)
+            .order(ByteOrder.nativeOrder())
+            .asFloatBuffer()
+            .put(Shaders.FULL_QUAD_VERTICES)
+        vertexBuffer?.position(0)
+
+        val flippedTexCoords = floatArrayOf(
+            0.0f, 0.0f,
+            1.0f, 0.0f,
+            0.0f, 1.0f,
+            1.0f, 1.0f
+        )
+        texCoordBuffer = ByteBuffer.allocateDirect(flippedTexCoords.size * 4)
+            .order(ByteOrder.nativeOrder())
+            .asFloatBuffer()
+            .put(flippedTexCoords)
+        texCoordBuffer?.position(0)
+
+        
+        indexBuffer = ByteBuffer.allocateDirect(Shaders.DRAW_ORDER.size * 2)
+            .order(ByteOrder.nativeOrder())
+            .asShortBuffer()
+            .put(Shaders.DRAW_ORDER)
+        indexBuffer?.position(0)
+    }
+
+    
+    fun release() {
+        if (isReleased) return
+
+        if (Thread.currentThread() === glThread) {
+            releaseOnGlThread()
+        } else {
+            runBlocking(glDispatcher) {
+                releaseOnGlThread()
+            }
+        }
+
+        isReleased = true
+        glDispatcher.close()
+    }
+
+    private fun releaseOnGlThread() {
+        if (!isInitialized) return
+        if (isOnGlThread()) {
+            releaseInternal()
+            return
+        }
+        runBlocking(glDispatcher) {
+            releaseInternal()
+        }
+    }
+
+    private fun releaseInternal() {
+        if (!isInitialized) return
+        EGL14.eglMakeCurrent(eglDisplay, eglSurface, eglSurface, eglContext)
+        GLES30.glFinish()
+
+        if (shaderProgram != 0) {
+            GLES30.glDeleteProgram(shaderProgram)
+        }
+        if (imageTextureId != 0) {
+            GLES30.glDeleteTextures(1, intArrayOf(imageTextureId), 0)
+        }
+        if (lutTextureId != 0) {
+            GLES30.glDeleteTextures(1, intArrayOf(lutTextureId), 0)
+        }
+        basicToneTextures.release()
+        releaseOutputFramebuffer()
+        releaseNaturalLightFramebuffer()
+        releaseNaturalLightOutputFramebuffer()
+        for (i in naturalLightPrograms.indices) {
+            if (naturalLightPrograms[i] != 0) {
+                GLES30.glDeleteProgram(naturalLightPrograms[i])
+                naturalLightPrograms[i] = 0
+            }
+        }
+        if (naturalLightHncsOutputProgram != 0) {
+            GLES30.glDeleteProgram(naturalLightHncsOutputProgram)
+            naturalLightHncsOutputProgram = 0
+        }
+        if (naturalLightSrgbOutputProgram != 0) {
+            GLES30.glDeleteProgram(naturalLightSrgbOutputProgram)
+            naturalLightSrgbOutputProgram = 0
+        }
+        naturalLightHncsGl?.release()
+        if (naturalLightCurveTextureId != 0) {
+            GLES30.glDeleteTextures(1, intArrayOf(naturalLightCurveTextureId), 0)
+            naturalLightCurveTextureId = 0
+            naturalLightCurveSize = 0
+        }
+        if (naturalLightDummy3DTextureId != 0) {
+            GLES30.glDeleteTextures(1, intArrayOf(naturalLightDummy3DTextureId), 0)
+            naturalLightDummy3DTextureId = 0
+        }
+        if (pboId != 0) {
+            GLES30.glDeleteBuffers(1, intArrayOf(pboId), 0)
+            pboId = 0
+        }
+        releaseReadbackBuffer()
+
+        if (bitmapDenoisePreconditionProgram != 0) GLES31.glDeleteProgram(bitmapDenoisePreconditionProgram)
+        if (bitmapDenoiseNlmInitProgram != 0) GLES31.glDeleteProgram(bitmapDenoiseNlmInitProgram)
+        if (bitmapDenoiseNlmFusedAccuProgram != 0) GLES31.glDeleteProgram(bitmapDenoiseNlmFusedAccuProgram)
+        if (bitmapDenoiseNlmFinishProgram != 0) GLES31.glDeleteProgram(bitmapDenoiseNlmFinishProgram)
+        if (bitmapDenoisePassthroughProgram != 0) GLES30.glDeleteProgram(bitmapDenoisePassthroughProgram)
+        if (naturalLightSrgbToLinearProgram != 0) GLES30.glDeleteProgram(naturalLightSrgbToLinearProgram)
+        if (bitmapChromaDenoiseGuideProgram != 0) GLES30.glDeleteProgram(bitmapChromaDenoiseGuideProgram)
+        if (bitmapChromaDenoiseProgram != 0) GLES30.glDeleteProgram(bitmapChromaDenoiseProgram)
+        if (lutSharpenProgram != 0) {
+            GLES30.glDeleteProgram(lutSharpenProgram)
+            lutSharpenProgram = 0
+        }
+        if (lutLuminanceGainProgram != 0) {
+            GLES30.glDeleteProgram(lutLuminanceGainProgram)
+            lutLuminanceGainProgram = 0
+        }
+        for (i in 0..1) {
+            if (bitmapDenoiseTexId[i] != 0) GLES30.glDeleteTextures(1, intArrayOf(bitmapDenoiseTexId[i]), 0)
+            if (bitmapDenoiseFboId[i] != 0) GLES30.glDeleteFramebuffers(1, intArrayOf(bitmapDenoiseFboId[i]), 0)
+        }
+        releaseLutSharpenFramebuffer()
+        if (bitmapDenoiseNlmU2BufferId != 0) {
+            GLES31.glDeleteBuffers(1, intArrayOf(bitmapDenoiseNlmU2BufferId), 0)
+            bitmapDenoiseNlmU2BufferId = 0
+        }
+        bitmapDenoiseNlmBufferPixels = 0
+
+        
+        if (hdfExtractBlurHProgram != 0) GLES30.glDeleteProgram(hdfExtractBlurHProgram)
+        if (hdfBlurVProgram != 0) GLES30.glDeleteProgram(hdfBlurVProgram)
+        if (softLightBlurHProgram != 0) GLES30.glDeleteProgram(softLightBlurHProgram)
+        if (clarityDownsampleProgram != 0) GLES30.glDeleteProgram(clarityDownsampleProgram)
+        if (clarityCompositeProgram != 0) GLES30.glDeleteProgram(clarityCompositeProgram)
+        releaseClarityFramebuffers()
+        filmGrainGl.release()
+        for (i in 0..1) {
+            if (hdfTexId[i] != 0) GLES30.glDeleteTextures(1, intArrayOf(hdfTexId[i]), 0)
+            if (hdfFboId[i] != 0) GLES30.glDeleteFramebuffers(1, intArrayOf(hdfFboId[i]), 0)
+            if (softLightTexId[i] != 0) GLES30.glDeleteTextures(1, intArrayOf(softLightTexId[i]), 0)
+            if (softLightFboId[i] != 0) GLES30.glDeleteFramebuffers(1, intArrayOf(softLightFboId[i]), 0)
+        }
+        
+        if (halationExtractBlurHProgram != 0) GLES30.glDeleteProgram(halationExtractBlurHProgram)
+        if (halationBlurVProgram != 0) GLES30.glDeleteProgram(halationBlurVProgram)
+        for (i in 0..1) {
+            if (halationTexId[i] != 0) GLES30.glDeleteTextures(1, intArrayOf(halationTexId[i]), 0)
+            if (halationFboId[i] != 0) GLES30.glDeleteFramebuffers(1, intArrayOf(halationFboId[i]), 0)
+        }
+        if (bloomDownsampleFirstProgram != 0) GLES30.glDeleteProgram(bloomDownsampleFirstProgram)
+        if (bloomDownsampleProgram != 0) GLES30.glDeleteProgram(bloomDownsampleProgram)
+        if (bloomUpsampleProgram != 0) GLES30.glDeleteProgram(bloomUpsampleProgram)
+        if (bloomCompositeProgram != 0) GLES30.glDeleteProgram(bloomCompositeProgram)
+        releaseBloomFramebuffers()
+        if (bloomOutputFboId != 0) GLES30.glDeleteFramebuffers(1, intArrayOf(bloomOutputFboId), 0)
+        if (bloomOutputTextureId != 0) GLES30.glDeleteTextures(1, intArrayOf(bloomOutputTextureId), 0)
+
+        EGL14.eglMakeCurrent(eglDisplay, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
+        EGL14.eglDestroySurface(eglDisplay, eglSurface)
+        EGL14.eglDestroyContext(eglDisplay, eglContext)
+        EGL14.eglTerminate(eglDisplay)
+
+        isInitialized = false
+        PLog.d(TAG, "LutImageProcessor released")
+    }
+
+    private fun isOnGlThread(): Boolean = Thread.currentThread() === glThread
+
+    companion object {
+        private const val TAG = "LutImageProcessor"
+        private const val BITMAP_DENOISE_A = 0.008f
+        private const val BITMAP_DENOISE_B = 0.0005f
+        private const val LUT_LUMINANCE_OFFSET = 1e-4f
+        private const val CLARITY_PYRAMID_LEVELS = 3
+        private const val EGL_CONTEXT_PRIORITY_LEVEL_IMG = 0x3100
+        private const val EGL_CONTEXT_PRIORITY_LOW_IMG = 0x3103
+
+        
+        private val IMAGE_VERTEX_SHADER = """
+            #version 300 es
+            
+            in vec4 aPosition;
+            in vec2 aTexCoord;
+            
+            out vec2 vTexCoord;
+            
+            uniform mat4 uMVPMatrix;
+            
+            void main() {
+                gl_Position = uMVPMatrix * aPosition;
+                vTexCoord = aTexCoord;
+            }
+        """.trimIndent()
+
+        private val TEXTURE_PASSTHROUGH_SHADER = """
+            #version 300 es
+            precision mediump float;
+
+            in vec2 vTexCoord;
+            out vec4 fragColor;
+
+            uniform sampler2D uInputTexture;
+
+            void main() {
+                fragColor = texture(uInputTexture, vTexCoord);
+            }
+        """.trimIndent()
+
+        private val LUT_LUMINANCE_GAIN_SHADER = """
+            #version 300 es
+            precision highp float;
+
+            in vec2 vTexCoord;
+            out vec4 fragColor;
+            uniform sampler2D uBeforeLutTexture;
+            uniform sampler2D uAfterLutTexture;
+            uniform float uOffset;
+
+            float srgbToLinear(float value) {
+                float magnitude = abs(value);
+                float linearMagnitude = magnitude <= 0.04045
+                    ? magnitude / 12.92
+                    : pow((magnitude + 0.055) / 1.055, 2.4);
+                return sign(value) * linearMagnitude;
+            }
+
+            vec3 srgbToLinear(vec3 value) {
+                return vec3(
+                    srgbToLinear(value.r),
+                    srgbToLinear(value.g),
+                    srgbToLinear(value.b)
+                );
+            }
+
+            void main() {
+                const vec3 LINEAR_SRGB_LUMA = vec3(0.2126, 0.7152, 0.0722);
+                vec3 beforeLinear = srgbToLinear(texture(uBeforeLutTexture, vTexCoord).rgb);
+                vec3 afterLinear = srgbToLinear(texture(uAfterLutTexture, vTexCoord).rgb);
+                float beforeLuma = max(dot(beforeLinear, LINEAR_SRGB_LUMA), 0.0);
+                float afterLuma = max(dot(afterLinear, LINEAR_SRGB_LUMA), 0.0);
+                float gain = (afterLuma + uOffset) / (beforeLuma + uOffset);
+                fragColor = vec4(gain, 0.0, 0.0, 1.0);
+            }
+        """.trimIndent()
+
+        private val SRGB_TO_LINEAR_SHADER = """
+            #version 300 es
+            precision highp float;
+
+            in vec2 vTexCoord;
+            out vec4 fragColor;
+
+            uniform sampler2D uInputTexture;
+
+            vec3 srgbToLinear(vec3 srgb) {
+                vec3 color = max(srgb, vec3(0.0));
+                bvec3 useHigh = greaterThan(color, vec3(0.04045));
+                vec3 low = color / 12.92;
+                vec3 high = pow((color + 0.055) / 1.055, vec3(2.4));
+                return vec3(
+                    useHigh.r ? high.r : low.r,
+                    useHigh.g ? high.g : low.g,
+                    useHigh.b ? high.b : low.b
+                );
+            }
+
+            void main() {
+                vec4 color = texture(uInputTexture, vTexCoord);
+                fragColor = vec4(srgbToLinear(color.rgb), color.a);
+            }
+        """.trimIndent()
+
+        private val SHADER_BODY = """
+            in vec2 vTexCoord;
+            out vec4 fragColor;
+
+            uniform mediump sampler3D uLutTexture;
+            uniform float uLutSize;
+            uniform float uLutIntensity;
+            uniform bool uLutEnabled;
+            uniform int uLutMaskType;
+            uniform int uLutCurve;
+            uniform int uLutColorSpace;
+            uniform int uInputColorSpace;
+            uniform bool uIsHlgInput;
+
+            uniform bool uColorRecipeEnabled;
+
+            uniform float uExposure;
+            uniform float uContrast;
+            uniform float uSaturation;
+            uniform float uTemperature;
+            uniform float uTint;
+            uniform float uFade;
+            uniform float uVibrance;
+            uniform float uHighlights;
+            uniform float uShadows;
+            uniform float uToneToe;
+            uniform float uToneShoulder;
+            uniform float uTonePivot;
+            uniform float uVignette;
+            uniform float uFlash;
+            uniform float uBleachBypass;
+            uniform float uNoise;
+            uniform float uNoiseSeed;
+            uniform float uLowRes;
+            uniform float uAspectRatio;
+            uniform vec3 uGradingHues;
+            uniform vec3 uGradingAmounts;
+            uniform vec3 uGradingLuminances;
+            uniform float uGradingBalance;
+            uniform float uGradingBlending;
+            
+
+            uniform mat3 uPrimaryCalibrationMatrix;
+            
+            uniform sampler2D uCurveTexture;
+            uniform bool uCurveEnabled;
+
+            uniform float uHalation;
+            uniform sampler2D uHdfTexture;
+            uniform float uSoftLight;
+            uniform sampler2D uSoftLightTexture;
+            uniform float uRedHalation;
+            uniform sampler2D uRedHalationTexture;
+            
+
+            uniform float uChromaticAberration;
+            uniform vec2 uTexelSize;
+            
+
+            const float PI = 3.14159265359;
+
+            float getLuma(vec3 color) {
+                vec3 weights = (uInputColorSpace == 1) ? vec3(0.2290, 0.6917, 0.0793) : vec3(0.2126, 0.7152, 0.0722);
+                return dot(color, weights);
+            }
+
+            ${PreviewColorShaderModules.COLOR_TRANSFER_CORE}
+            ${PreviewColorShaderModules.HLG_TO_LINEAR}
+            ${PreviewColorShaderModules.EXPOSURE}
+            ${DirectFlashShader.GLSL}
+            ${ThreeWayColorGradingShader.GLSL}
+            ${PreviewColorShaderModules.SANITIZE}
+            ${BasicToneLutShader.GLSL}
+
+            vec3 prepareToneSample(vec3 sampleColor) {
+                vec3 prepared = sampleColor;
+                if (uIsHlgInput) {
+                    prepared = hlgToLinear(prepared);
+                    prepared = linearToSrgb(prepared);
+                }
+                if (abs(uExposure) > 0.001) {
+                    prepared = applyExposureInLinearSpace(prepared, uExposure);
+                }
+                return sanitizeColor(prepared);
+            }
+
+            vec3 sampleToneSource(vec2 uv) {
+                return prepareToneSample(sampleImage(clamp(uv, vec2(0.0), vec2(1.0))).rgb);
+            }
+
+            vec3 shRgbToXyz(vec3 rgb) {
+                vec3 linearRgb = srgbToLinear(rgb);
+                return mat3(
+                    0.4360747, 0.2225045, 0.0139322,
+                    0.3850649, 0.7168786, 0.0971045,
+                    0.1430804, 0.0606169, 0.7141733
+                ) * linearRgb;
+            }
+
+            vec3 shXyzToRgb(vec3 xyz) {
+                vec3 linearRgb = mat3(
+                     3.1338561, -0.9787684,  0.0719453,
+                    -1.6168667,  1.9161415, -0.2289914,
+                    -0.4906146,  0.0334540,  1.4052427
+                ) * xyz;
+                return linearToSrgb(linearRgb);
+            }
+
+            ${ShadowsHighlightsShader.GLSL}
+
+            float applyToneCurveToLuma(float luma, float toe, float shoulder, float pivot) {
+                float safeLuma = clamp(luma, 0.0, 1.0);
+                float pivotPoint = clamp(0.5 + pivot * 0.12, 0.2, 0.8);
+                float toeAmount = clamp(abs(toe), 0.0, 1.0);
+                float shoulderAmount = clamp(abs(shoulder), 0.0, 1.0);
+                float toeGamma = (toe >= 0.0)
+                    ? mix(1.0, 0.68, toeAmount)
+                    : mix(1.0, 1.85, toeAmount);
+                float shoulderGamma = (shoulder >= 0.0)
+                    ? mix(1.0, 0.72, shoulderAmount)
+                    : mix(1.0, 1.85, shoulderAmount);
+
+                if (safeLuma <= pivotPoint) {
+                    float segment = clamp(safeLuma / max(pivotPoint, 0.0001), 0.0, 1.0);
+                    return clamp(pow(segment, toeGamma) * pivotPoint, 0.0, 1.0);
+                }
+
+                float segment = clamp((safeLuma - pivotPoint) / max(1.0 - pivotPoint, 0.0001), 0.0, 1.0);
+                float result = 1.0 - pow(max(0.0, 1.0 - segment), shoulderGamma) * (1.0 - pivotPoint);
+                return clamp(result, 0.0, 1.0);
+            }
+
+            vec3 applyToneCurve(vec3 color, float toe, float shoulder, float pivot) {
+                if (abs(toe) < 0.001 && abs(shoulder) < 0.001 && abs(pivot) < 0.001) {
+                    return color;
+                }
+                vec3 nonNegativeColor = max(color, vec3(0.0));
+                vec3 curveSampleColor = clamp(nonNegativeColor, 0.0, 1.0);
+                float luma = getLuma(curveSampleColor);
+                float peak = max(curveSampleColor.r, max(curveSampleColor.g, curveSampleColor.b));
+                float toneSignal = mix(luma, peak, 0.65);
+                float curvedSignal = applyToneCurveToLuma(toneSignal, toe, shoulder, pivot);
+                if (toneSignal < 0.0001) {
+                    return curveSampleColor;
+                }
+                float safeRatio = clamp(curvedSignal / max(toneSignal, 0.0001), 0.0, 16.0);
+                vec3 scaled = nonNegativeColor * safeRatio;
+                return sanitizeColor(mix(vec3(curvedSignal), scaled, 0.96));
+            }
+
+            ${PreviewColorShaderModules.OKLAB}
+
+            ${PreviewColorShaderModules.LCH_CLASSIFIERS}
+
+            ${PreviewColorShaderModules.LUT_MASK}
+            ${PreviewColorShaderModules.OKLCH_DENSITY}
+
+            ${PreviewColorShaderModules.LCH_MIXER}
+
+            ${PreviewColorShaderModules.PRIMARY_CALIBRATION}
+            ${PreviewColorShaderModules.EXTENDED_LUT_CURVES}
+            ${PreviewColorShaderModules.LUT_COLOR_SPACE}
+            
+
+            float gaussian(float x, float invSigmaSq2) {
+                return exp(-x * invSigmaSq2);
+            }
+            
+
+            vec3 rgb2ycbcr(vec3 rgb) {
+                float y  =  0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b;
+                float cb = -0.169 * rgb.r - 0.331 * rgb.g + 0.500 * rgb.b + 0.5;
+                float cr =  0.500 * rgb.r - 0.419 * rgb.g - 0.081 * rgb.b + 0.5;
+                return vec3(y, cb, cr);
+            }
+            
+
+            vec3 ycbcr2rgb(vec3 ycbcr) {
+                float y  = ycbcr.x;
+                float cb = ycbcr.y - 0.5;
+                float cr = ycbcr.z - 0.5;
+                float r = y + 1.402 * cr;
+                float g = y - 0.344 * cb - 0.714 * cr;
+                float b = y + 1.772 * cb;
+                return vec3(r, g, b);
+            }
+
+            void main() {
+
+                vec2 uvCoord = vTexCoord;
+                if (uLowRes > 0.005) {
+                    float blocksX = mix(512.0, 32.0, uLowRes); 
+                    vec2 gridSize = vec2(1.0 / blocksX, 1.0 / (blocksX / uAspectRatio));
+                    vec2 gridUV = floor(vTexCoord / gridSize) * gridSize + gridSize * 0.5;
+                    uvCoord = mix(vTexCoord, gridUV, 0.95);
+                }
+
+                vec4 color;
+                if (uChromaticAberration > 0.0) {
+                    vec2 center = vec2(0.5);
+                    vec2 dir = uvCoord - center;
+                    float dist = length(dir);
+                    float offset = pow(dist, 1.5) * uChromaticAberration * 0.08;
+                    vec2 rUV = uvCoord + dir * offset;
+                    vec2 bUV = uvCoord - dir * offset;
+                    float r = sampleImage(rUV).r;
+                    float g = sampleImage(uvCoord).g;
+                    float b = sampleImage(bUV).b;
+                    float a = sampleImage(uvCoord).a;
+                    color = vec4(r, g, b, a);
+                } else {
+                    color = sampleImage(uvCoord);
+                }
+
+                if (uIsHlgInput) {
+                    color.rgb = hlgToLinear(color.rgb);
+                    color.rgb = linearToSrgb(color.rgb);
+                }
+
+                if (uColorRecipeEnabled) {
+
+                    if (abs(uExposure) > 0.001) {
+                        color.rgb = applyExposureInLinearSpace(color.rgb, uExposure);
+                        color.rgb = sanitizeColor(color.rgb);
+                    }
+
+                    color.rgb = applyShadowsHighlights(color.rgb, uvCoord);
+                    color.rgb = sanitizeColor(color.rgb);
+
+                    color.rgb = (color.rgb - 0.5) * uContrast + 0.5;
+                    color.rgb = sanitizeColor(color.rgb);
+
+                    color.rgb = applyToneCurve(color.rgb, uToneToe, uToneShoulder, uTonePivot);
+                    color.rgb = sanitizeColor(color.rgb);
+
+                    color.rgb = applyBasicToneLut(color.rgb);
+                    color.rgb = sanitizeColor(color.rgb);
+
+                    color.r += uTemperature * 0.1;
+                    color.b -= uTemperature * 0.1;
+                    color.g -= uTint * 0.05;
+                    color.rgb = sanitizeColor(color.rgb);
+
+                    float gray = getLuma(color.rgb);
+                    color.rgb = mix(vec3(gray), color.rgb, uSaturation);
+                    color.rgb = sanitizeColor(color.rgb);
+
+                    if (abs(uVibrance) > 0.001) {
+                        color.rgb = applyOklchDensity(color.rgb, uVibrance);
+                        color.rgb = sanitizeColor(color.rgb);
+                    }
+
+                    color.rgb = applyPrimaryCalibration(color.rgb);
+                    color.rgb = sanitizeColor(color.rgb);
+
+                    color.rgb = applyLchColorMixer(color.rgb);
+                    color.rgb = sanitizeColor(color.rgb);
+
+                    color.rgb = applyThreeWayColorGrading(
+                        color.rgb,
+                        uGradingHues,
+                        uGradingAmounts,
+                        uGradingLuminances,
+                        uGradingBalance,
+                        uGradingBlending,
+                        (uInputColorSpace == 1)
+                            ? vec3(0.2290, 0.6917, 0.0793)
+                            : vec3(0.2126, 0.7152, 0.0722)
+                    );
+                    color.rgb = sanitizeColor(color.rgb);
+
+                    if (uFade > 0.0) {
+                        float fadeAmount = uFade * 0.3;
+                        color.rgb = mix(color.rgb, vec3(0.5), fadeAmount);
+                        color.rgb += fadeAmount * 0.1;
+                        color.rgb = sanitizeColor(color.rgb);
+                    }
+
+                    if (uBleachBypass > 0.0) {
+
+                        float luma = getLuma(color.rgb);
+                        vec3 desaturated = mix(color.rgb, vec3(luma), 0.6);
+                        
+
+                        desaturated = (desaturated - 0.5) * 1.3 + 0.5;
+                        
+
+                        desaturated.r *= 0.95;
+                        desaturated.g *= 1.02;
+                        desaturated.b *= 1.05;
+                        
+
+                        color.rgb = mix(color.rgb, desaturated, uBleachBypass);
+                    }
+
+                    if (uFlash > 0.001) {
+                        color.rgb = applyDirectFlash(color.rgb, uvCoord, uAspectRatio, uFlash);
+                        color.rgb = sanitizeColor(color.rgb);
+                    }
+
+                    if (abs(uVignette) > 0.0) {
+
+                        vec2 center = vec2(0.5, 0.5);
+                        float dist = distance(uvCoord, center);
+                        
+
+                        float vignetteMask = smoothstep(0.8, 0.3, dist);
+                        
+
+                        if (uVignette < 0.0) {
+
+                            color.rgb *= mix(0.01, 1.0, vignetteMask) * abs(uVignette) + (1.0 + uVignette);
+                        } else {
+
+                            color.rgb = mix(color.rgb, vec3(1.0), (1.0 - vignetteMask) * uVignette);
+                        }
+                    }
+
+                    if (uNoise > 0.001) {
+                        vec2 seedOffset = vec2(fract(uNoiseSeed * 1.234), fract(uNoiseSeed * 3.456));
+                        vec2 noiseCoord = uvCoord * 800.0 + seedOffset * 100.0;
+                        
+                        float lumNoise = fract(sin(dot(noiseCoord, vec2(12.9898, 78.233))) * 43758.5453);
+                        lumNoise = (lumNoise - 0.5) * 2.0;
+                        
+                        float colorNoiseR = fract(sin(dot(noiseCoord + vec2(1.1, 2.2), vec2(39.346, 11.135))) * 43758.5453);
+                        float colorNoiseG = fract(sin(dot(noiseCoord + vec2(3.3, 4.4), vec2(73.156, 52.235))) * 43758.5453);
+                        float colorNoiseB = fract(sin(dot(noiseCoord + vec2(5.5, 6.6), vec2(27.423, 83.136))) * 43758.5453);
+                        vec3 colorNoise = (vec3(colorNoiseR, colorNoiseG, colorNoiseB) - 0.5) * 2.0;
+
+                        float luma = getLuma(color.rgb);
+                        float noiseMask = mix(0.5, 1.0, 1.0 - abs(luma - 0.5) * 1.5);
+                        
+                        vec3 finalNoise = mix(vec3(lumNoise), mix(vec3(lumNoise), colorNoise, 0.7), 0.8);
+                        
+                        color.rgb += finalNoise * uNoise * max(0.0, noiseMask);
+                    }
+
+                    color.rgb = sanitizeColor(color.rgb);
+                }
+
+                if (uCurveEnabled) {
+                    vec3 clamped = clamp(color.rgb, 0.0, 1.0);
+                    float r = texture(uCurveTexture, vec2(clamped.r, 0.5)).r;
+                    float g = texture(uCurveTexture, vec2(clamped.g, 0.5)).g;
+                    float b = texture(uCurveTexture, vec2(clamped.b, 0.5)).b;
+                    color.rgb = sanitizeColor(vec3(r, g, b));
+                }
+
+                if (uHalation > 0.0) {
+                    vec3 bloom = texture(uHdfTexture, uvCoord).rgb;
+                    
+
+                    float bLuma = dot(bloom, vec3(0.2126, 0.7152, 0.0722));
+                    bloom = mix(vec3(bLuma), bloom, 1.6); 
+                    
+
+                    vec3 bloomEffect = bloom * uHalation * 1.4;
+                    
+
+                    color.rgb = vec3(1.0) - (vec3(1.0) - color.rgb) * (vec3(1.0) - bloomEffect);
+                    
+
+                    float mist = bLuma * uHalation * 0.15;
+                    color.rgb += mist;
+                    
+
+                    color.rgb = (color.rgb - 0.5) * (1.0 - uHalation * 0.08) + 0.5;
+                }
+                
+                if (uRedHalation > 0.0) {
+                    vec3 halationBlur = texture(uRedHalationTexture, uvCoord).rgb;
+                    float halationMask = smoothstep(0.001, 0.06, dot(halationBlur, vec3(0.2126, 0.7152, 0.0722)));
+                    vec3 halationStrength = vec3(0.42, 0.14, 0.02) * uRedHalation;
+                    color.rgb += halationBlur * halationStrength * halationMask;
+                }
+
+                if (uLutEnabled && uLutIntensity > 0.0) {
+                    bool isP3 = (uInputColorSpace == 1);
+                    vec3 linearInput = srgbToLinear(color.rgb);
+                    
+                    if (isP3) {
+                         linearInput = mat3(1.22486, -0.04205, -0.01974, -0.22471, 1.04192, -0.07865, 0.00000, 0.00013, 1.09837) * linearInput;
+                    }
+                    float effectiveLutIntensity = uLutIntensity * lutMaskWeight(uLutMaskType, linearInput);
+
+                    vec3 colorSpaceRGB = applyLutColorSpace(linearInput, uLutColorSpace);
+                    vec3 lutInColor = applyLutCurve(colorSpaceRGB, uLutCurve);
+                    
+                    float scale = (uLutSize - 1.0) / uLutSize;
+                    float offset = 1.0 / (2.0 * uLutSize);
+                    vec3 lutCoord = lutInColor * scale + offset;
+                    vec4 lutColor = texture(uLutTexture, lutCoord);
+
+                    vec3 srgbColor = linearToSrgb(linearInput);
+                    color.rgb = mix(srgbColor, lutColor.rgb, effectiveLutIntensity);
+
+                    if (isP3) {
+
+                        vec3 linearSrgbOut = srgbToLinear(color.rgb);
+	                        color.rgb = linearToSrgb(mat3(0.875905, 0.035332, 0.016382, 0.122070, 0.964542, 0.063767, 0.002025, 0.000126, 0.919851) * linearSrgbOut);
+	                    }
+	                }
+
+                if (uSoftLight > 0.0) {
+                    vec3 softBlur = texture(uSoftLightTexture, uvCoord).rgb;
+                    vec3 screen = vec3(1.0) - (vec3(1.0) - color.rgb) * (vec3(1.0) - softBlur);
+                    vec3 softGlow = mix(color.rgb, screen, 0.42);
+                    color.rgb = mix(color.rgb, softGlow, uSoftLight * 0.75);
+                    float softLuma = dot(softBlur, vec3(0.2126, 0.7152, 0.0722));
+                    color.rgb += vec3(softLuma) * (uSoftLight * 0.025);
+                    color.rgb = (color.rgb - 0.5) * (1.0 - uSoftLight * 0.05) + 0.5;
+                }
+                fragColor = clamp(color, 0.0, 1.0);
+            }
+        """.trimIndent()
+
+        private val IMAGE_FRAGMENT_SHADER_COLOR_RECIPE = "#version 300 es\n" +
+                "precision highp float;\n" +
+                "uniform sampler2D uImageTexture;\n" +
+                "vec4 sampleImage(vec2 uv) { return texture(uImageTexture, uv); }\n" +
+                SHADER_BODY
+
+        
+
+        private val HALATION_EXTRACT_BLUR_H_SHADER = """
+            #version 300 es
+            precision highp float;
+            
+            in vec2 vTexCoord;
+            out vec4 fragColor;
+            
+            uniform sampler2D uInputTexture;
+            uniform vec2 uTexelSize;
+            uniform float uThreshold;
+            uniform float uStrength;
+            
+            void main() {
+                vec3 tint = vec3(1.0, 0.28, 0.04);
+                
+                #define EXTRACT(sampleColor) \
+                    (max(sampleColor - vec3(uThreshold), vec3(0.0)) * tint * (1.5 + uStrength * 3.0) * smoothstep(uThreshold - 0.24, uThreshold + 0.36, max(sampleColor.r, max(sampleColor.g, sampleColor.b))))
+                
+                vec3 color = texture(uInputTexture, vTexCoord).rgb;
+                vec3 sum = EXTRACT(color) * 0.204164;
+                
+                float weights[5] = float[](0.204164, 0.304005, 0.093910, 0.010416, 0.000005);
+                float offsets[5] = float[](0.0, 1.407333, 3.294215, 5.176470, 7.058823);
+                
+                for (int i = 1; i < 5; i++) {
+                    float offset = offsets[i] * uTexelSize.x * 2.0;
+                    sum += EXTRACT(texture(uInputTexture, vTexCoord + vec2(offset, 0.0)).rgb) * weights[i];
+                    sum += EXTRACT(texture(uInputTexture, vTexCoord - vec2(offset, 0.0)).rgb) * weights[i];
+                }
+                
+                fragColor = vec4(sum, 1.0);
+            }
+        """.trimIndent()
+
+        
+        private val HDF_EXTRACT_BLUR_H_SHADER = """
+            #version 300 es
+            precision highp float;
+            
+            in vec2 vTexCoord;
+            out vec4 fragColor;
+            
+            uniform sampler2D uInputTexture;
+            uniform vec2 uTexelSize;
+            uniform float uThreshold;
+            uniform float uStrength;
+            
+            void main() {
+                vec3 color = texture(uInputTexture, vTexCoord).rgb;
+                
+
+                float luma = dot(color, vec3(0.2126, 0.7152, 0.0722));
+                float extractionVal = mix(luma, max(color.r, max(color.g, color.b)), 0.6);
+                
+
+                float highlightMask = smoothstep(uThreshold - 0.1, uThreshold + 0.25, extractionVal);
+                float midMask = smoothstep(uThreshold - 0.5, uThreshold, extractionVal) * 0.4;
+                float mask = (highlightMask + midMask * uStrength);
+                
+                vec3 highlight = color * mask;
+                
+
+                float weights[5] = float[](0.204164, 0.304005, 0.093910, 0.010416, 0.000005);
+                float offsets[5] = float[](0.0, 1.407333, 3.294215, 5.176470, 7.058823);
+                
+                vec3 sum = highlight * weights[0];
+                for (int i = 1; i < 5; i++) {
+                    float offset = offsets[i] * uTexelSize.x * 2.0;
+                    sum += texture(uInputTexture, vTexCoord + vec2(offset, 0.0)).rgb * weights[i];
+                    sum += texture(uInputTexture, vTexCoord - vec2(offset, 0.0)).rgb * weights[i];
+                }
+                
+                fragColor = vec4(sum, 1.0);
+            }
+        """.trimIndent()
+
+        
+        private val HDF_BLUR_V_SHADER = """
+            #version 300 es
+            precision highp float;
+            
+            in vec2 vTexCoord;
+            out vec4 fragColor;
+            
+            uniform sampler2D uInputTexture;
+            uniform vec2 uTexelSize;
+            
+            void main() {
+
+                float weights[5] = float[](0.204164, 0.304005, 0.093910, 0.010416, 0.000005);
+                float offsets[5] = float[](0.0, 1.407333, 3.294215, 5.176470, 7.058823);
+                
+                vec3 sum = texture(uInputTexture, vTexCoord).rgb * weights[0];
+                for (int i = 1; i < 5; i++) {
+                    float offset = offsets[i] * uTexelSize.y * 2.0;
+                    sum += texture(uInputTexture, vTexCoord + vec2(0.0, offset)).rgb * weights[i];
+                    sum += texture(uInputTexture, vTexCoord - vec2(0.0, offset)).rgb * weights[i];
+                }
+                
+                fragColor = vec4(sum, 1.0);
+            }
+        """.trimIndent()
+    }
+}

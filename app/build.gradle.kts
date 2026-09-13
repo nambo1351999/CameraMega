@@ -18,12 +18,12 @@ fun String.toBuildConfigString(): String =
     "\"${replace("\\", "\\\\").replace("\"", "\\\"")}\""
 
 android {
-    namespace = "com.mega.superx.filter.camera"
+    namespace = "com.mega.filter.camera"
     compileSdk = 36
     ndkVersion = "29.0.14206865"
 
     defaultConfig {
-        applicationId = "com.mega.super.filter.camera"
+        applicationId = "com.mega.filter.camera"
         minSdk = 30
         targetSdk = 36
         versionCode = 148

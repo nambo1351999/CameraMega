@@ -193,7 +193,7 @@
                 android:launchMode="singleTop"
                 android:theme="@style/Theme.CameraMega.Transparent">
             <intent-filter>
-                <action android:name="com.mega.superx.filter.camera.action.SELECT_MGC_LOOK" />
+                <action android:name="com.mega.filter.camera.action.SELECT_MGC_LOOK" />
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity>

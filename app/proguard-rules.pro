@@ -23,7 +23,7 @@
 -repackageclasses
 
 # Keep JNI used classes
--keep class com.mega.superx.filter.camera.raw.DngRawData {
+-keep class com.mega.filter.camera.raw.DngRawData {
     <init>(...);
     *;
 }
