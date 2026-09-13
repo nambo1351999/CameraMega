@@ -2,10 +2,10 @@
 
 ## Project
 
-**Camera Mega** (`com.zoomx.mega.cameramega`) — professional Android camera app.
+**Camera Mega** (`com.mega.superx.filter.camera`) — professional Android camera app.
 
 - **Stack:** Kotlin, Jetpack Compose, Camera2/CameraX, DataStore, native C++ (CMake)
-- **Package:** `com.zoomx.mega.cameramega`
+- **Package:** `com.mega.superx.filter.camera`
 - **Branding:** Always **CameraMega** / **Camera Mega** — never rename to SuperCamera
 
 ## Navigation flow (2026-09)

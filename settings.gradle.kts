@@ -22,6 +22,6 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "CameraMega"
+rootProject.name = "SuperFilterCamera"
 include(":app")
  

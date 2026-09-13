@@ -1,0 +1,11 @@
+package com.mega.superx.filter.camera.livephoto
+
+interface LivePhotoCreator {
+    
+    fun create(
+        jpegPath: String,
+        videoPath: String,
+        outputPath: String,
+        presentationTimestampUs: Long = 0
+    ): Boolean
+}
