@@ -55,12 +55,15 @@ android {
 
     signingConfigs {
         create("release") {
-            val storeFileProp = project.findProperty("RELEASE_STORE_FILE") as? String
+            fun prop(name: String): String? =
+                project.findProperty(name) as? String ?: localProperties.getProperty(name)
+
+            val storeFileProp = prop("RELEASE_STORE_FILE")
             if (storeFileProp != null) {
-                storeFile = file(storeFileProp)
-                storePassword = project.findProperty("RELEASE_STORE_PASSWORD") as? String
-                keyAlias = project.findProperty("RELEASE_KEY_ALIAS") as? String
-                keyPassword = project.findProperty("RELEASE_KEY_PASSWORD") as? String
+                storeFile = rootProject.file(storeFileProp)
+                storePassword = prop("RELEASE_STORE_PASSWORD")
+                keyAlias = prop("RELEASE_KEY_ALIAS")
+                keyPassword = prop("RELEASE_KEY_PASSWORD")
             }
         }
     }

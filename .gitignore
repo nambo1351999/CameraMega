@@ -10,6 +10,8 @@ build
 local.properties
 app/*/release
 app/release.jks
+signing-credentials.local.txt
+keystore.properties
 .gradle-home
 /MGC
 /AGC
